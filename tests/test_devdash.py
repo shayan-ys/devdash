@@ -117,3 +117,68 @@ def test_fetch_does_not_hide_other_errors(monkeypatch):
     monkeypatch.setattr(devdash, "run", fake_run)
     with pytest.raises(RuntimeError, match="401"):
         devdash.fetch_prs([], review_requested=True)
+
+
+DAY = 86400
+NOW = 1_800_000_000
+
+
+def limit(window, used, left, duration=None):
+    win = {"id": window, "resetsAt": (NOW + left) * 1000}
+    if duration:
+        win["durationMs"] = duration * 1000
+    return {"label": "x", "window": win, "amount": {"usedFraction": used}}
+
+
+def test_monthly_window_starts_one_calendar_month_before_reset():
+    from datetime import UTC, datetime
+    reset = datetime(2026, 3, 31, 12, tzinfo=UTC).timestamp()
+    start = devdash.window_start({"id": "monthly", "resetsAt": reset * 1000})
+    assert datetime.fromtimestamp(start, UTC) == datetime(2026, 2, 28, 12, tzinfo=UTC)
+
+
+def test_pace_is_points_used_ahead_of_time():
+    # 20% used with 4 of 7 days gone: 37 points behind. 60% with 3 of 7 gone: 17 ahead.
+    assert devdash.pace(limit("7d", 0.20, 3 * DAY), NOW) == -37
+    assert devdash.pace(limit("7d", 0.60, 4 * DAY, duration=7 * DAY), NOW) == 17
+
+
+@pytest.mark.parametrize(("points", "icon"), [
+    (0, "|"), (4, "|"), (-4, "|"),
+    (5, ">"), (15, ">>"), (29, ">>"), (30, ">>>"),
+    (-5, "<"), (-15, "<<"), (-30, "<<<"),
+])
+def test_pace_icon_steps(points, icon):
+    assert devdash.pace_icon(points).plain == icon
+
+
+@pytest.mark.parametrize("lim", [
+    limit("5h", 0.9, 3600),          # not a multi-day window
+    limit("7d", 0.05, 7 * DAY - 3600),  # an hour in: too early to judge
+    limit("mystery", 0.5, DAY),      # no way to know when the window began
+    dict(limit("7d", 1.0, 3 * DAY), status="exhausted"),  # nothing left to pace
+])
+def test_pace_hidden(lim):
+    assert devdash.pace(lim, NOW) is None
+
+
+
+@pytest.mark.parametrize("show", [True, False])
+def test_usage_row_shows_pace_icon_unless_turned_off(show):
+    st = devdash.State()
+    st.show_pace = show
+    st.usage = {"reports": [{"provider": "cursor", "fetchedAt": NOW * 1000,
+                             "limits": [dict(limit("monthly", 0.34, 11 * DAY), label="Cursor Models")]}]}
+    row = devdash.render_usage(st, 50, NOW)[-1].plain
+    assert ("<<" in row) is show
+
+
+@pytest.mark.parametrize(("points", "row"), [
+    (None, "        34%         "),
+    (0,    "        34% |       "),
+    (20,   "        34% >>      "),
+    (-20,  "     << 34%         "),
+])
+def test_pace_icon_sits_beside_a_value_that_never_moves(points, row):
+    icon = devdash.pace_icon(points) if points is not None else None
+    assert devdash.meter(0.0, 20, "34%", icon=icon).plain == row

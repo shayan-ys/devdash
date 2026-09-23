@@ -21,6 +21,9 @@ enabled = "auto"  # true | false | "auto"
 # Force a fresh usage read when the cached one is older than this many seconds. 0 = never force.
 refetch_after = 180
 
+# Show a pace icon on weekly and monthly bars: > >> >>> too fast, < << <<< too slow, | on pace.
+pace = true
+
 # Providers listed here come first, in this order; the rest follow in the built-in order.
 order = []  # e.g. ["openai-codex", "anthropic"]
 

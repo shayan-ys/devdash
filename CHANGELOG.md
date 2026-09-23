@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Pace icons on weekly and monthly usage bars: `>` to `>>>` when you use a quota faster than
+  time passes, `<` to `<<<` when slower, `|` on pace. Turn them off with `usage.pace = false`.
+
 ## [0.1.0] - 2026-09-23
 
 ### Added

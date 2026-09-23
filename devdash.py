@@ -17,6 +17,7 @@ Keys while watching: r = refresh now, q = quit.
 """
 
 import argparse
+import calendar
 import json
 import os
 import re
@@ -29,7 +30,7 @@ import time
 import tomllib
 import tty
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import UTC, datetime
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -93,7 +94,7 @@ def line(*parts):
 DEFAULTS = {
     "interval": 60,
     "github": {"exclude": [], "review_requested": True},
-    "usage": {"enabled": "auto", "refetch_after": 180, "order": [], "names": {}, "colors": {}},
+    "usage": {"enabled": "auto", "refetch_after": 180, "pace": True, "order": [], "names": {}, "colors": {}},
 }
 REPO_RULE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?$")
 
@@ -241,21 +242,82 @@ def heat(frac):
     return "#%02x%02x%02x" % HEAT[-1][1]
 
 
-def meter(frac, width, label, exhausted=False):
+def meter(frac, width, label, exhausted=False, icon=None):
     """A bar with its value printed inside, like omp's context meter. Each
     filled cell takes the heat colour of its own position, so a fuller bar
-    runs from green through amber to red."""
+    runs from green through amber to red. `icon` (a pace icon) sits one space
+    right of the value, or left for a slow '<' icon; the value never moves."""
     frac = 1.0 if exhausted else max(0.0, min(1.0, frac))
-    text = label.center(width)
+    left = (width - len(label)) // 2
+    cells = [" "] * width
+    cells[left:left + len(label)] = label
+    icon_at = range(0)
+    if icon is not None:
+        at = left - 1 - len(icon) if icon.plain.startswith("<") else left + len(label) + 1
+        if at >= 0 and at + len(icon) <= width:
+            cells[at:at + len(icon)] = icon.plain
+            icon_at = range(at, at + len(icon))
     full = round(frac * width)
     tip = heat(frac)
     t = Text(no_wrap=True)
-    for i, ch in enumerate(text):
+    for i, ch in enumerate(cells[:width]):
         if i < full:
             t.append(ch, style=f"bold {INK} on {heat(i / max(1, width - 1))}")
+        elif i in icon_at:
+            t.append(ch, style=f"{icon.style} on {TRACK}")
         else:
             t.append(ch, style=f"bold {tip} on {TRACK}")
     return t
+
+
+DAY = 86400
+WINDOW_SECONDS = {"5h": 5 * 3600, "daily": DAY, "7d": 7 * DAY, "weekly": 7 * DAY}
+
+
+def window_start(win):
+    """Epoch seconds when a limit's window began, or None. omp gives no
+    duration for calendar-month windows, so those start one month before reset."""
+    reset = win.get("resetsAt")
+    if not reset:
+        return None
+    reset /= 1000
+    if win.get("durationMs"):
+        return reset - win["durationMs"] / 1000
+    if win.get("id") == "monthly":
+        r = datetime.fromtimestamp(reset, UTC)
+        y, m = (r.year, r.month - 1) if r.month > 1 else (r.year - 1, 12)
+        return r.replace(year=y, month=m, day=min(r.day, calendar.monthrange(y, m)[1])).timestamp()
+    span = WINDOW_SECONDS.get(win.get("id"))
+    return reset - span if span else None
+
+
+def pace(lim, now):
+    """Points of quota used ahead of (+) or behind (-) the share of time gone,
+    for multi-day windows, else None. Hidden early in a window, where 1% after
+    an hour would read as a wild pace."""
+    win = lim.get("window") or {}
+    used = (lim.get("amount") or {}).get("usedFraction")
+    start = window_start(win)
+    if used is None or start is None or lim.get("status") == "exhausted":
+        return None
+    span, gone = win["resetsAt"] / 1000 - start, now - start
+    if span < 2 * DAY or gone < max(DAY / 2, span / 10) or gone >= span:
+        return None
+    return round((used - gone / span) * 100)
+
+
+# Pace icon by distance from on-pace, in points: > fast, < slow, | on pace.
+PACE_STEPS = [(30, 3), (15, 2), (5, 1)]
+FAST_STYLE = {1: "yellow3", 2: "dark_orange", 3: "bold red1"}
+SLOW_STYLE = {1: "#79c0ff", 2: "#79c0ff", 3: "bold #79c0ff"}
+
+
+def pace_icon(points):
+    """'|' within 5 points of pace, then one to three '>' (too fast) or '<' (too slow)."""
+    n = next((k for step, k in PACE_STEPS if abs(points) >= step), 0)
+    if not n:
+        return Text("|", style=OK)
+    return Text((">" if points > 0 else "<") * n, style=(FAST_STYLE if points > 0 else SLOW_STYLE)[n])
 
 
 def usage_rows(report):
@@ -316,8 +378,11 @@ def render_usage(st, width, now):
                     val = f"${amt['used']:.0f}/${amt['limit']:.0f}"
                 else:
                     val = f"{frac * 100:.0f}%"
-                value = meter(frac, bar_w, val, lim.get("status") == "exhausted")
-                if stale and reset and reset / 1000 < now:  # the old number no longer applies
+                expired = stale and reset and reset / 1000 < now  # the old number no longer applies
+                delta = pace(lim, now) if st.show_pace and not expired else None
+                icon = pace_icon(delta) if delta is not None else None
+                value = meter(frac, bar_w, val, lim.get("status") == "exhausted", icon)
+                if expired:
                     value = Text("reset since last read".center(bar_w)[:bar_w], style=f"{LABEL} on {TRACK}")
             out.append(line((label + " ", LABEL), value, " ", rst))
     missing = sorted({PROVIDER_NAME.get(a["provider"], a["provider"]) for a in data.get("accountsWithoutUsage", [])})
@@ -586,6 +651,7 @@ class State:
     interval = 60
     show_usage = True
     show_review = True
+    show_pace = True
     excluded = []
 
 
@@ -679,6 +745,7 @@ def main():
     PROVIDER_ORDER[:] = list(dict.fromkeys(usage["order"] + PROVIDER_ORDER))
     PROVIDER_NAME.update(usage["names"])
     BRAND.update(usage["colors"])
+    st.show_pace = usage["pace"]
     usage_every = args.usage_every if args.usage_every is not None else usage["refetch_after"]
     if args.cached or usage_every == 0:
         usage_every = None
