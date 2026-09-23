@@ -22,7 +22,8 @@ named `devdash`.
 - **Review requests.** PRs that wait for you, newest first, with the author and age, and a marker
   when someone requests your review again.
 - **OMP AI usage (optional).** Rate-limit bars and reset countdowns for every provider that
-  the [OMP](https://omp.sh) coding agent tracks. Hidden when `omp` is not installed.
+  the [OMP](https://omp.sh) coding agent tracks. Hidden when `omp` is not installed. Weekly and
+  monthly bars show a pace icon (`>>` too fast, `<<` too slow, `|` on pace).
 - **Hide what you do not want to see.** Exclude single repositories or whole organizations.
 
 PR numbers are clickable in terminals that support hyperlinks.
@@ -90,6 +91,22 @@ devdash --help                     # all flags
 |`⚠conflict` `↓behind`|Merge conflict, or the branch is behind its base|
 |`⇢queued #2`|Position in the merge queue|
 
+### Usage pace
+
+Weekly and monthly bars have a pace icon beside the percentage: fast and on-pace icons on its
+right, slow icons on its left. It compares the share of
+the quota you used with the share of the window that has passed. For example, 34% used with
+19 of 30 days gone (63%) is 29 points slow: `<<`.
+
+|Icon|Points from pace|Meaning|
+|---|---|---|
+|`\|`|less than 5|On pace|
+|`>` `>>` `>>>`|5, 15, 30 or more ahead|Too fast; `>>>` runs out well before the reset|
+|`<` `<<` `<<<`|5, 15, 30 or more behind|Too slow; you have quota to spare|
+
+There is no icon on 5-hour windows, or in the first 10% (at least 12 hours) of a window,
+where one busy hour looks like a runaway pace. Set `usage.pace = false` to hide the icons.
+
 ## Configuration
 
 Every setting is optional. devdash reads a [TOML](https://toml.io) file from the first of:
@@ -108,6 +125,7 @@ review_requested = true          # show the REVIEW REQUESTED section
 [usage]
 enabled = "auto"                 # true, false, or "auto" (only when omp is installed)
 refetch_after = 180              # force a fresh usage read after this many seconds; 0 = never
+pace = true                      # pace icons (> fast, < slow, | on pace) on weekly and monthly bars
 order = ["openai-codex", "anthropic"]
 
 [usage.names]

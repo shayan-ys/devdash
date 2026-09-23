@@ -24,6 +24,8 @@ USAGE = {"reports": [
         limit("Claude 5 Hour", "5h", 0.42, 2 * HOUR + 1500), limit("Claude 7 Day", "7d", 0.71, 3 * 24 * HOUR)]},
     {"provider": "openai-codex", "fetchedAt": NOW * 1000, "limits": [
         limit("5 Hour", "5h", 0.12, 4 * HOUR), limit("7 Day", "7d", 0.93, 40 * 60)]},
+    {"provider": "cursor", "fetchedAt": NOW * 1000, "limits": [
+        limit("Cursor Models", "monthly", 0.34, 11 * 24 * HOUR)]},
 ]}
 
 
