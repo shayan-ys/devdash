@@ -1,0 +1,31 @@
+name: Bug report
+description: Something shows the wrong thing, or devdash fails.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what you saw. Remove private repository or PR names.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: devdash version
+      description: Output of `devdash --version`.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, terminal, Python version, and `gh --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Error output
+      description: Any error text devdash printed.
+      render: text

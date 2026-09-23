@@ -1,0 +1,45 @@
+[project]
+name = "devdash"
+version = "0.1.0"
+description = "A narrow terminal dashboard for GitHub PRs, GitHub stacks (gh-stack), reviews, and OMP AI usage."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Shayan" }]
+requires-python = ">=3.12"
+dependencies = ["rich>=13"]
+keywords = ["github", "pull-requests", "dashboard", "terminal", "tui", "gh-stack"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/shayan-ys/devdash"
+Issues = "https://github.com/shayan-ys/devdash/issues"
+
+[project.scripts]
+devdash = "devdash:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["devdash.py"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]

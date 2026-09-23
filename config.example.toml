@@ -1,0 +1,32 @@
+# Dev-Dashboard (devdash) settings. Copy to ~/.config/devdash/config.toml (or $XDG_CONFIG_HOME/devdash/config.toml),
+# or point --config / $DEVDASH_CONFIG at any path. Every key is optional; the values below are the defaults.
+# Command-line flags override this file.
+
+# Seconds between refreshes.
+interval = 60
+
+[github]
+# Repositories to hide from both PR sections. An entry is "owner/repo" for one repository,
+# or a bare "owner" for every repository of that user or organization.
+#   exclude = ["my-org/monorepo", "some-other-org"]
+exclude = []
+
+# Show the REVIEW REQUESTED section.
+review_requested = true
+
+[usage]
+# The USAGE section reads `omp usage`. "auto" shows it only when `omp` is on PATH.
+enabled = "auto"  # true | false | "auto"
+
+# Force a fresh usage read when the cached one is older than this many seconds. 0 = never force.
+refetch_after = 180
+
+# Providers listed here come first, in this order; the rest follow in the built-in order.
+order = []  # e.g. ["openai-codex", "anthropic"]
+
+# Display names and heading colours per omp provider id.
+[usage.names]
+# anthropic = "Claude"
+
+[usage.colors]
+# anthropic = "#d97757"
