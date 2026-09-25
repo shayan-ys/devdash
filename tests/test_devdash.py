@@ -108,6 +108,53 @@ def test_fetch_retries_without_stack_field_when_schema_lacks_it(monkeypatch):
     assert len(queries) == 3  # the fallback is remembered: no second failed attempt
 
 
+def rollup(*nodes, state="FAILURE"):
+    return {"commits": {"nodes": [{"commit": {"statusCheckRollup": {
+        "state": state, "contexts": {"nodes": list(nodes)}}}}]}}
+
+
+def check(name, conclusion, status="COMPLETED", database_id=1, started="2026-09-25T16:00:00Z"):
+    return {"__typename": "CheckRun", "name": name, "status": status,
+            "conclusion": conclusion, "databaseId": database_id, "startedAt": started}
+
+
+def test_ci_badge_uses_the_latest_run_of_a_check_name():
+    """A cancelled workflow posts Verify / gate FAILURE; the surviving run posts SUCCESS.
+    statusCheckRollup.state stays FAILURE because every run remains on the SHA."""
+    pr = rollup(
+        check("Verify / gate", "FAILURE", database_id=1, started="2026-09-25T15:57:07Z"),
+        check("Verify / gate", "SUCCESS", database_id=2, started="2026-09-25T16:04:12Z"),
+        check("Infra / gate", "FAILURE", database_id=3, started="2026-09-25T15:57:07Z"),
+        check("Infra / gate", "SUCCESS", database_id=4, started="2026-09-25T15:57:32Z"),
+        check("Infra / plan (${{ matrix.env }})", "CANCELLED", database_id=5),
+        {"__typename": "StatusContext", "context": "CodeRabbit", "state": "SUCCESS",
+         "createdAt": "2026-09-25T16:00:00Z"},
+    )
+    badge, failed = devdash.ci_badge(pr)
+    assert badge.plain == "✓ci"
+    assert failed == ""
+
+
+def test_ci_badge_a_later_failure_replaces_an_earlier_pass():
+    pr = rollup(
+        check("Verify / gate", "SUCCESS", database_id=1),
+        check("Verify / gate", "FAILURE", database_id=2),
+    )
+    badge, failed = devdash.ci_badge(pr)
+    assert badge.plain == "✗ci1"
+    assert failed == "Verify / gate"
+
+
+def test_ci_badge_a_rerun_in_progress_is_pending_not_the_old_result():
+    pr = rollup(
+        check("Verify / gate", "SUCCESS", database_id=1),
+        check("Verify / gate", None, status="IN_PROGRESS", database_id=2),
+    )
+    badge, failed = devdash.ci_badge(pr)
+    assert badge.plain == "●ci1"
+    assert failed == ""
+
+
 def test_fetch_does_not_hide_other_errors(monkeypatch):
     monkeypatch.setattr(devdash, "HAS_STACK", True)
 

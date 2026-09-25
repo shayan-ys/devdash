@@ -83,7 +83,7 @@ devdash --help                     # all flags
 
 |Mark|Meaning|
 |---|---|
-|`✓ci` `●ci2` `✗ci1`|Checks passed, 2 still running, 1 failed (the first failed check is named at the end of the row)|
+|`✓ci` `●ci2` `✗ci1`|Latest run of each check passed, 2 still running, 1 failed (the first failed check is named at the end of the row)|
 |`approved` `changes` `needs review`|The PR's review decision|
 |`✓dana` `✗lee` `✎sam`|A reviewer's latest review: approved, requested changes, commented|
 |`bot✎2`|Reviews from 2 bots|

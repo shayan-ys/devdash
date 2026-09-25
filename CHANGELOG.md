@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- CI badge uses the latest run of each check name, matching the PR merge box. A cancelled
+  workflow's failed `Verify / gate` no longer keeps a later green run red.
+
 ### Added
 
 - Pace icons on weekly and monthly usage bars: `>` to `>>>` when you use a quota faster than

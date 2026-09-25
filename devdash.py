@@ -407,8 +407,8 @@ fragment P on PullRequest {
   viewerLatestReview { state }
   commits(last: 1) { nodes { commit { statusCheckRollup { state
     contexts(first: 100) { nodes { __typename
-      ... on CheckRun { name status conclusion }
-      ... on StatusContext { context state } } } } } } }
+      ... on CheckRun { name status conclusion databaseId startedAt }
+      ... on StatusContext { context state createdAt } } } } } } }
 }
 """
 # gh-stack's `stack` field is not in every GitHub schema (GitHub Enterprise Server, for one).
@@ -449,6 +449,27 @@ query {{
     return keep(d["mine"]["nodes"]), keep(d["review"]["nodes"]) if review_requested else []
 
 
+def latest_contexts(nodes):
+    """One entry per check name / status context: the newest run.
+
+    GitHub's statusCheckRollup keeps every check-run on the SHA, so a
+    cancelled in-progress run's `Verify / gate` FAILURE sits next to the
+    later SUCCESS. The PR merge box and `gh pr checks` use the latest of
+    each name; the rollup `state` does not.
+    """
+    latest = {}
+    for i, ctx in enumerate(nodes):
+        if ctx.get("__typename") == "CheckRun":
+            key = ("check", ctx["name"])
+            sort = (ctx.get("databaseId") or 0, ctx.get("startedAt") or "", i)
+        else:
+            key = ("status", ctx.get("context"))
+            sort = (0, ctx.get("createdAt") or "", i)
+        if key not in latest or sort > latest[key][0]:
+            latest[key] = (sort, ctx)
+    return [item[1] for item in latest.values()]
+
+
 def ci_badge(pr):
     """(Text badge, name of the first failed check or '')."""
     nodes = pr["commits"]["nodes"]
@@ -456,7 +477,7 @@ def ci_badge(pr):
     if not roll:
         return Text("○ci", style=META), ""
     failed, running = [], 0
-    for ctx in roll["contexts"]["nodes"]:
+    for ctx in latest_contexts(roll["contexts"]["nodes"]):
         if ctx["__typename"] == "CheckRun":
             if ctx["status"] != "COMPLETED":
                 running += 1
@@ -468,11 +489,9 @@ def ci_badge(pr):
             running += 1
     if failed:
         return Text(f"✗ci{len(failed)}", style=f"bold {BAD}"), failed[0]
-    if running or roll["state"] in ("PENDING", "EXPECTED"):
+    if running:
         return Text(f"●ci{running or ''}", style=WARN), ""
-    if roll["state"] == "SUCCESS":
-        return Text("✓ci", style=OK), ""
-    return Text("✗ci", style=BAD), ""
+    return Text("✓ci", style=OK), ""
 
 
 DECISION = {"APPROVED": ("approved", f"bold {OK}"),
