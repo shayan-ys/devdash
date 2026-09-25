@@ -21,9 +21,13 @@ named `devdash`.
   and merge-queue position.
 - **Review requests.** PRs that wait for you, newest first, with the author and age, and a marker
   when someone requests your review again.
-- **OMP AI usage (optional).** Rate-limit bars and reset countdowns for every provider that
-  the [OMP](https://omp.sh) coding agent tracks. Hidden when `omp` is not installed. Weekly and
-  monthly bars show a pace icon (`>>` too fast, `<<` too slow, `|` on pace).
+- **OMP AI usage (optional).** Rate-limit bars and reset countdowns for providers with
+  usage reports in the selected [OMP](https://omp.sh) profile. OpenRouter spend and remaining
+  credits are read from its [key](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key)
+  and [credits](https://openrouter.ai/docs/api/api-reference/credits/get-credits) endpoints.
+  Nous Portal credits are read from the Portal account API when omp has a `nous-portal` or
+  `nous` credential. Hidden when `omp` is not installed. Weekly and monthly bars show a pace
+  icon (`>>` too fast, `<<` too slow, `|` on pace).
 - **Hide what you do not want to see.** Exclude single repositories or whole organizations.
 
 PR numbers are clickable in terminals that support hyperlinks.
@@ -74,10 +78,26 @@ devdash --once                     # print one frame and exit
 devdash --exclude acme/monorepo    # hide one repository
 devdash --exclude acme             # hide every repository of a user or organization
 devdash --no-review --no-usage     # show only your own PRs
+devdash --profile personal --once  # show usage from the personal omp profile
+devdash --github alice             # MY PRS / REVIEW REQUESTED for this gh login
 devdash --help                     # all flags
 ```
 
 `--once` is also the behavior when standard input is not a terminal, so `devdash | less -R` works.
+`--profile NAME` uses the same isolated auth, settings, and usage cache as `omp --profile NAME`.
+Without the flag, devdash follows omp's default profile (or `$OMP_PROFILE`). Usage from one
+profile is never reused as the last-good reading for another. Providers with an authenticated
+account but no available usage data appear under `no data`. With `--profile`, each provider
+heading includes that provider's account email in white, for example `Codex (user@example.com)`.
+
+`--github USER` is the GitHub username from `gh auth status` (not an email). It scopes MY PRS
+and REVIEW REQUESTED to that login without running `gh auth switch`. It does not label usage.
+
+OpenRouter shows **per-key** spending, not your overall account balance. An API key limit
+appears as a spend bar; an unlimited key shows dollars spent. If its key is not available
+through `omp token openrouter`, or OpenRouter rejects it, the provider stays hidden.
+Nous Portal has no published read-only usage/balance API; view its usage at
+[Nous subscription management](https://portal.nousresearch.com/manage-subscription).
 
 ### Status row legend
 
@@ -141,8 +161,8 @@ key or a value of the wrong type stops devdash with an error, so a typo cannot f
 
 ## Troubleshooting
 
-**`gh is not signed in`.** Run `gh auth login`. devdash uses the account that `gh` uses; with
-more than one account, `gh auth switch` selects it.
+**`gh is not signed in`.** Run `gh auth login`. With more than one account, pass `--github USER`
+(the username from `gh auth status`) or set `github.account` in the config file.
 
 **A PR is missing.** devdash shows the first 50 open PRs you wrote and the first 50 that request
 your review. Excluded repositories do not count toward the 50.
@@ -155,6 +175,16 @@ devdash then rebuilds stacks from branch chains.
 and omp then drops the provider from its report. devdash keeps the last good read, marks it stale,
 and saves it in `$XDG_CACHE_HOME/devdash/`. To make fewer requests, raise `refetch_after` or use
 `--cached`.
+
+**OpenRouter is missing.** `omp usage` does not report every configured model provider.
+devdash queries OpenRouter's per-key usage and remaining-credits APIs with the key returned by
+`omp --profile NAME token openrouter`; the key stays in memory and is never saved in
+the dashboard cache. Check that the key belongs to the selected profile and remains valid.
+
+**Nous Portal is missing.** Portal credits are not part of `omp usage`. devdash calls
+`https://portal.nousresearch.com/api/oauth/account` with `omp --profile NAME token nous-portal`
+(or `nous`). A browser or Hermes login is not visible to omp; store the Portal credential in
+the selected omp profile first. Inference keys that cannot read the account API are omitted.
 
 ## Related projects
 
