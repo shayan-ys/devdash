@@ -9,7 +9,7 @@ Sources (both are the tools' own JSON):
   - `gh api graphql`              your open PRs, grouped into native gh-stack
                                   stacks (or base->head chains for older ones),
                                   and PRs where your review is requested
-  - `omp usage --json --redact`   every AI provider's limits and reset times
+  - `omp usage --json`   every AI provider's limits and reset times
                                   (optional; shown only when `omp` is installed)
 
 Settings come from a TOML file (see --config); command-line flags win.
@@ -18,6 +18,7 @@ Keys while watching: r = refresh now, q = quit.
 
 import argparse
 import calendar
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,7 @@ import tomllib
 import tty
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from urllib.request import Request, urlopen
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -69,12 +71,27 @@ def dur(sec):
     return f"{m}m" if m else f"{sec}s"
 
 
-def run(cmd, timeout=45):
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+def run(cmd, timeout=45, env=None):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     if p.returncode:
         tail = (p.stderr or p.stdout).strip().splitlines()
         raise RuntimeError(tail[-1] if tail else f"{cmd[0]} failed")
     return p.stdout
+
+
+def github_env(account):
+    """Use a named gh login for this process only; never switch the active account."""
+    if not account:
+        return None
+    p = subprocess.run(["gh", "auth", "token", "-u", account],
+                       capture_output=True, text=True, timeout=10)
+    token = p.stdout.strip() if p.returncode == 0 else ""
+    if not token:
+        tail = (p.stderr or "").strip().splitlines()
+        raise RuntimeError(tail[-1] if tail else f"gh is not signed in as {account}")
+    env = os.environ.copy()
+    env["GH_TOKEN"] = env["GITHUB_TOKEN"] = token
+    return env
 
 
 def line(*parts):
@@ -93,7 +110,7 @@ def line(*parts):
 # ── config ────────────────────────────────────────────────────────────────────
 DEFAULTS = {
     "interval": 60,
-    "github": {"exclude": [], "review_requested": True},
+    "github": {"exclude": [], "review_requested": True, "account": ""},
     "usage": {"enabled": "auto", "refetch_after": 180, "pace": True, "order": [], "names": {}, "colors": {}},
 }
 REPO_RULE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?$")
@@ -153,17 +170,134 @@ def is_excluded(repo, rules):
 
 
 # ── usage ─────────────────────────────────────────────────────────────────────
-PROVIDER_ORDER = ["anthropic", "openai-codex", "google-antigravity", "cursor"]
+PROVIDER_ORDER = ["anthropic", "openai-codex", "google-antigravity", "cursor",
+                  "openrouter", "nous-portal"]
 PROVIDER_NAME = {"anthropic": "Anthropic", "openai-codex": "Codex",
-                 "google-antigravity": "Antigravity", "cursor": "Cursor"}
+                 "google-antigravity": "Antigravity", "cursor": "Cursor",
+                 "openrouter": "OpenRouter", "nous-portal": "Nous Portal"}
 WINDOW_SHORT = {"5h": "5h", "7d": "7d", "weekly": "wk", "monthly": "mo", "extra": "extra"}
+EXTRA_USAGE = ("openrouter", "nous-portal")
 
 
-def fetch_usage(invalidate):
+def fetch_usage(invalidate, profile=None):
+    prefix = ["--profile", profile] if profile is not None else []
     if invalidate:
-        subprocess.run(["omp", "usage", "invalidate"], capture_output=True, timeout=30)
-    return json.loads(run(["omp", "usage", "--json", "--redact"]))
+        subprocess.run(["omp", *prefix, "usage", "invalidate"], capture_output=True, timeout=30)
+    data = json.loads(run(["omp", *prefix, "usage", "--json"]))
+    have = {r["provider"] for r in data.get("reports", [])}
+    for extra in (fetch_openrouter, fetch_nous_portal):
+        report = extra(profile)
+        if report and report["provider"] not in have:
+            data.setdefault("reports", []).append(report)
+            have.add(report["provider"])
+    return data
 
+
+def omp_token(profile, provider):
+    """Return a provider credential from omp without logging or storing it."""
+    prefix = ["--profile", profile] if profile is not None else []
+    token = subprocess.run(["omp", *prefix, "token", provider],
+                           capture_output=True, text=True, timeout=10)
+    value = token.stdout.strip() if token.returncode == 0 else ""
+    return value or None
+
+
+def bearer_json(url, token):
+    request = Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    with urlopen(request, timeout=10) as response:
+        return json.load(response)
+
+
+def num(value):
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def epoch_ms(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()[:-1] + "+00:00" if value.strip().endswith("Z") else value.strip()
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return int(dt.timestamp() * 1000)
+
+
+def extra_report(provider, limits):
+    if not limits:
+        return None
+    return {"provider": provider, "fetchedAt": int(time.time() * 1000), "limits": limits}
+
+
+def usd_amount(used, cap=None):
+    amount = {"used": used, "unit": "usd"}
+    if cap is not None:
+        amount["limit"] = cap
+        amount["usedFraction"] = used / cap if cap > 0 else 1.0
+    return amount
+
+
+def fetch_openrouter(profile):
+    """Use omp's selected profile credential without persisting or logging the key."""
+    try:
+        token = omp_token(profile, "openrouter")
+        if not token:
+            return None
+        key = bearer_json("https://openrouter.ai/api/v1/key", token)["data"]
+        try:
+            credits = bearer_json("https://openrouter.ai/api/v1/credits", token).get("data") or {}
+        except (OSError, ValueError, KeyError, TypeError, TimeoutError):
+            credits = {}
+        period = key.get("limit_reset")
+        used = key.get({"daily": "usage_daily", "weekly": "usage_weekly",
+                        "monthly": "usage_monthly"}.get(period, "usage"))
+        cap = num(key.get("limit"))
+        limits = []
+        if used is not None:
+            limits.append({"label": "key spend", "amount": usd_amount(used, cap)})
+        total_credits, total_usage = num(credits.get("total_credits")), num(credits.get("total_usage"))
+        if total_credits is not None and total_usage is not None:
+            limits.append({"label": "credits left",
+                           "amount": usd_amount(max(0.0, total_credits - total_usage))})
+        return extra_report("openrouter", limits)
+    except (OSError, ValueError, KeyError, TypeError, TimeoutError):
+        return None
+
+
+def fetch_nous_portal(profile):
+    """Read Portal credits from omp's nous-portal/nous credential. Never reads Hermes auth files."""
+    try:
+        token = omp_token(profile, "nous-portal") or omp_token(profile, "nous")
+        if not token:
+            return None
+        payload = bearer_json("https://portal.nousresearch.com/api/oauth/account", token)
+        if not isinstance(payload, dict) or payload.get("error"):
+            return None
+        sub = payload.get("subscription") if isinstance(payload.get("subscription"), dict) else {}
+        access = payload.get("paid_service_access") if isinstance(payload.get("paid_service_access"), dict) else {}
+        monthly, remaining = num(sub.get("monthly_credits")), num(sub.get("credits_remaining"))
+        total = num(access.get("total_usable_credits"))
+        purchased = num(access.get("purchased_credits_remaining"))
+        limits = []
+        if monthly is not None and monthly > 0 and remaining is not None:
+            used = max(0.0, monthly - remaining)
+            lim = {"label": "subscription", "amount": usd_amount(used, monthly)}
+            reset = epoch_ms(sub.get("current_period_end"))
+            if reset:
+                lim["window"] = {"id": "monthly", "resetsAt": reset}
+            limits.append(lim)
+        left = total if total is not None else remaining
+        if left is not None and not limits:
+            limits.append({"label": "credits left", "amount": usd_amount(left)})
+        elif total is not None and remaining is not None and total != remaining:
+            limits.append({"label": "credits left", "amount": usd_amount(total)})
+        if purchased is not None and purchased > 0:
+            limits.append({"label": "top-up", "amount": usd_amount(purchased)})
+        return extra_report("nous-portal", limits)
+    except (OSError, ValueError, KeyError, TypeError, TimeoutError):
+        return None
 
 
 def carry_over(old, new):
@@ -181,21 +315,32 @@ def carry_over(old, new):
     return new
 
 
-def load_last_good():
+def last_good_path(profile=None):
+    """Return the cache path for a selected omp profile, or the legacy default."""
+    if profile is None:
+        profile = os.environ.get("OMP_PROFILE")
+    if profile is None:
+        return LAST_GOOD
+    suffix = hashlib.sha256(profile.encode()).hexdigest()
+    return LAST_GOOD.removesuffix(".json") + f"-{suffix}.json"
+
+
+def load_last_good(profile=None):
     """The last good read survives restarts, so a launch during a 429 still shows Anthropic."""
     try:
-        with open(LAST_GOOD) as f:
+        with open(last_good_path(profile)) as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
 
 
-def save_last_good(data):
-    os.makedirs(os.path.dirname(LAST_GOOD), exist_ok=True)
-    tmp = LAST_GOOD + ".tmp"
+def save_last_good(data, profile=None):
+    path = last_good_path(profile)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump({"reports": data.get("reports", [])}, f)
-    os.replace(tmp, LAST_GOOD)
+    os.replace(tmp, path)
 
 
 def oldest_read(data):
@@ -326,7 +471,8 @@ def usage_rows(report):
     for lim in report.get("limits", []):
         key = (lim["label"], (lim.get("window") or {}).get("resetsAt"))
         amt = lim.get("amount") or {}
-        if key in seen or (amt.get("usedFraction") is None and not amt.get("used")):
+        if key in seen or (amt.get("usedFraction") is None and not amt.get("used")
+                           and report["provider"] not in EXTRA_USAGE):
             continue
         seen.add(key)
         rows.append(lim)
@@ -360,7 +506,9 @@ def render_usage(st, width, now):
         brand = BRAND.get(p, "bright_white")
         if idx[p] == 1 and r is not rows[0][0]:
             out.append(Text())
-        out.append(line(("● ", brand), (name, f"bold {brand}"), note))
+        email = (r.get("metadata") or {}).get("email") if st.omp_profile else None
+        who = (f" ({email})", "bright_white") if email else ""
+        out.append(line(("● ", brand), (name, f"bold {brand}"), who, note))
         for lim in limits:
             amt = lim.get("amount") or {}
             frac = amt.get("usedFraction")
@@ -372,7 +520,9 @@ def render_usage(st, width, now):
                 rst = (" " * 6, LABEL)
             label = short_label(lim).ljust(lab_w)
             if frac is None:  # an uncapped counter
-                value = Text(f"{int(amt['used'])} {amt.get('unit', '')}".center(bar_w), style=f"{LABEL} on {TRACK}")
+                value = Text((f"${amt['used']:.2f}" if amt.get("unit") == "usd"
+                              else f"{int(amt['used'])} {amt.get('unit', '')}").center(bar_w),
+                             style=f"{LABEL} on {TRACK}")
             else:
                 if amt.get("unit") == "usd" and amt.get("limit"):
                     val = f"${amt['used']:.0f}/${amt['limit']:.0f}"
@@ -388,8 +538,6 @@ def render_usage(st, width, now):
     missing = sorted({PROVIDER_NAME.get(a["provider"], a["provider"]) for a in data.get("accountsWithoutUsage", [])})
     if missing:
         out.append(line((f"no data: {', '.join(missing)}", WARN)))
-    if data.get("disabledCredentials"):
-        out.append(line((f"{len(data['disabledCredentials'])} disabled credential(s)", META)))
     return out
 
 
@@ -418,7 +566,7 @@ STACK_FIELD = ("stack { number size baseRefName "
 HAS_STACK = True
 
 
-def fetch_prs(excluded, review_requested):
+def fetch_prs(excluded, review_requested, account=None):
     global HAS_STACK
     # Search qualifiers keep excluded repos from eating the 50-result pages;
     # is_excluded below is the backstop for anything the search still returns.
@@ -433,7 +581,8 @@ query {{
     while True:
         query = PR_FIELDS.replace("{stack}", STACK_FIELD if HAS_STACK else "") + body
         try:
-            data = json.loads(run(["gh", "api", "graphql", "-f", f"query={query}"]))
+            data = json.loads(run(["gh", "api", "graphql", "-f", f"query={query}"],
+                                  env=github_env(account)))
             break
         except RuntimeError as e:
             if not (HAS_STACK and "Field 'stack' doesn't exist" in str(e)):
@@ -661,6 +810,9 @@ class State:
     usage = None
     usage_at = 0
     usage_err = None
+    omp_profile = None
+    gh_account = None
+    cache_profile = None
     usage_inval_at = 0
     mine, review = [], []
     prs_at = 0
@@ -707,14 +859,14 @@ def refresh(st, pool, usage_every, force):
         age = oldest_read(st.usage)
         invalidate = (usage_every is not None and since >= 60
                       and (force or age is None or age >= usage_every))
-        fu = pool.submit(fetch_usage, invalidate)
-    fp = pool.submit(fetch_prs, st.excluded, st.show_review)
+        fu = pool.submit(fetch_usage, invalidate, st.omp_profile)
+    fp = pool.submit(fetch_prs, st.excluded, st.show_review, st.gh_account)
     if fu:
         try:
             st.usage, st.usage_at, st.usage_err = carry_over(st.usage, fu.result()), time.time(), None
             if invalidate:
                 st.usage_inval_at = now
-            save_last_good(st.usage)
+            save_last_good(st.usage, st.cache_profile)
         except Exception as e:  # keep the last good data on screen
             st.usage_err = str(e)[:80]
     try:
@@ -729,6 +881,11 @@ def parse_args():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-c", "--config", metavar="PATH",
                     help=f"TOML settings file (default $DEVDASH_CONFIG, else {CONFIG_PATH})")
+    ap.add_argument("--profile", metavar="NAME",
+                    help="use this omp profile for usage and its saved cache")
+    ap.add_argument("--github", metavar="USER",
+                    help="GitHub username for MY PRS and REVIEW REQUESTED "
+                         "(config: github.account; from `gh auth status`)")
     ap.add_argument("-n", "--interval", type=int, help="seconds between refreshes (config: interval, 60)")
     ap.add_argument("--exclude", action="append", default=[], metavar="OWNER[/REPO]",
                     help="hide a repository, or every repository of an owner; repeatable, "
@@ -758,6 +915,7 @@ def main():
     st = State()
     st.interval = args.interval or cfg["interval"]
     st.excluded = check_rules(list(gh["exclude"]) + args.exclude)
+    st.gh_account = args.github or gh["account"] or None
     st.show_review = gh["review_requested"] and not args.no_review
     st.show_usage = not args.no_usage and (usage["enabled"] is True
                                            or (usage["enabled"] == "auto" and shutil.which("omp") is not None))
@@ -773,11 +931,16 @@ def main():
     # refetch; the saved last good reads fill any provider omp dropped.
     st.usage_inval_at = time.time()
     if st.show_usage:
-        st.usage = load_last_good()
+        st.omp_profile = args.profile
+        st.cache_profile = (args.profile if args.profile is not None
+                            else os.environ.get("OMP_PROFILE"))
+        st.usage = load_last_good(st.cache_profile)
     try:
-        st.me = run(["gh", "api", "user", "--jq", ".login"]).strip()
+        st.me = run(["gh", "api", "user", "--jq", ".login"], env=github_env(st.gh_account)).strip()
     except RuntimeError as e:
-        raise SystemExit(f"devdash: gh is not signed in ({e}); run `gh auth login`") from None
+        hint = "; pass --github USER from `gh auth status`" if st.gh_account else "; run `gh auth login`"
+        who = f" as {st.gh_account}" if st.gh_account else ""
+        raise SystemExit(f"devdash: gh is not signed in{who} ({e}){hint}") from None
     pool = ThreadPoolExecutor(2)
 
     if args.once or not sys.stdin.isatty():

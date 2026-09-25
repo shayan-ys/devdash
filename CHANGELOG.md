@@ -6,15 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `--profile NAME` selects the matching isolated omp profile for usage and cached readings;
+  only that profile's authenticated providers appear. Provider headings include that
+  provider's account email in white, for example `Codex (user@example.com)`.
+- `--github USER` (config: `github.account`) selects a `gh` login for MY PRS and REVIEW
+  REQUESTED without switching the active account.
+- OpenRouter per-key spend, remaining credits, and key-limit display using the selected
+  omp profile's credential.
+- Nous Portal subscription and remaining credits when the selected omp profile has a
+  `nous-portal` or `nous` credential.
+- Pace icons on weekly and monthly usage bars: `>` to `>>>` when you use a quota faster than
+  time passes, `<` to `<<<` when slower, `|` on pace. Turn them off with `usage.pace = false`.
+
 ### Fixed
 
 - CI badge uses the latest run of each check name, matching the PR merge box. A cancelled
   workflow's failed `Verify / gate` no longer keeps a later green run red.
-
-### Added
-
-- Pace icons on weekly and monthly usage bars: `>` to `>>>` when you use a quota faster than
-  time passes, `<` to `<<<` when slower, `|` on pace. Turn them off with `usage.pace = false`.
 
 ## [0.1.0] - 2026-09-23
 

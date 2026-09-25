@@ -14,6 +14,10 @@ exclude = []
 # Show the REVIEW REQUESTED section.
 review_requested = true
 
+# GitHub username from `gh auth status` (`--github`). Empty uses gh's active account.
+# account = "alice"
+account = ""
+
 [usage]
 # The USAGE section reads `omp usage`. "auto" shows it only when `omp` is on PATH.
 enabled = "auto"  # true | false | "auto"
