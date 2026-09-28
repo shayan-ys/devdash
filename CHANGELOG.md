@@ -22,8 +22,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- CI badge uses the latest run of each check name, matching the PR merge box. A cancelled
-  workflow's failed `Verify / gate` no longer keeps a later green run red.
+- CI badge uses the latest Actions run of each workflow, then the latest check of each
+  name, matching the PR merge box. A cancelled workflow's failed `Verify / gate` no
+  longer keeps a later green run red, or a still-running rerun that has not posted gate yet.
 
 ## [0.1.0] - 2026-09-23
 

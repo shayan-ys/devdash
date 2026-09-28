@@ -555,7 +555,7 @@ fragment P on PullRequest {
   viewerLatestReview { state }
   commits(last: 1) { nodes { commit { statusCheckRollup { state
     contexts(first: 100) { nodes { __typename
-      ... on CheckRun { name status conclusion databaseId startedAt }
+      {check_run}
       ... on StatusContext { context state createdAt } } } } } } }
 }
 """
@@ -563,11 +563,17 @@ fragment P on PullRequest {
 # Without it, stacks are rebuilt from base-branch -> head-branch chains instead.
 STACK_FIELD = ("stack { number size baseRefName "
                "entries(first: 30) { nodes { position pullRequest { number state title url } } } }")
+CHECK_RUN_CORE = "... on CheckRun { name status conclusion databaseId startedAt }"
+CHECK_RUN_SUITE = (
+    CHECK_RUN_CORE[:-2]
+    + " checkSuite { workflowRun { databaseId createdAt workflow { name } } } }"
+)
 HAS_STACK = True
+HAS_WORKFLOW_RUN = True
 
 
 def fetch_prs(excluded, review_requested, account=None):
-    global HAS_STACK
+    global HAS_STACK, HAS_WORKFLOW_RUN
     # Search qualifiers keep excluded repos from eating the 50-result pages;
     # is_excluded below is the backstop for anything the search still returns.
     skip = " ".join(f"-repo:{r}" if "/" in r else f"-user:{r}" for r in excluded)
@@ -579,15 +585,24 @@ query {{
   {review}
 }}"""
     while True:
-        query = PR_FIELDS.replace("{stack}", STACK_FIELD if HAS_STACK else "") + body
+        query = (PR_FIELDS
+                 .replace("{stack}", STACK_FIELD if HAS_STACK else "")
+                 .replace("{check_run}", CHECK_RUN_SUITE if HAS_WORKFLOW_RUN else CHECK_RUN_CORE)
+                 + body)
         try:
             data = json.loads(run(["gh", "api", "graphql", "-f", f"query={query}"],
                                   env=github_env(account)))
             break
         except RuntimeError as e:
-            if not (HAS_STACK and "Field 'stack' doesn't exist" in str(e)):
-                raise
-            HAS_STACK = False
+            msg = str(e)
+            if HAS_STACK and "Field 'stack' doesn't exist" in msg:
+                HAS_STACK = False
+                continue
+            if HAS_WORKFLOW_RUN and ("Field 'checkSuite' doesn't exist" in msg
+                                     or "Field 'workflowRun' doesn't exist" in msg):
+                HAS_WORKFLOW_RUN = False
+                continue
+            raise
     if data.get("errors") and not data.get("data"):
         raise RuntimeError(data["errors"][0].get("message", "graphql error"))
     d = data["data"]
@@ -598,17 +613,38 @@ query {{
     return keep(d["mine"]["nodes"]), keep(d["review"]["nodes"]) if review_requested else []
 
 
-def latest_contexts(nodes):
-    """One entry per check name / status context: the newest run.
+def workflow_run(ctx):
+    run = ((ctx.get("checkSuite") or {}).get("workflowRun") or {})
+    name = (run.get("workflow") or {}).get("name") or ""
+    return name, run.get("databaseId") or 0, run.get("createdAt") or ""
 
-    GitHub's statusCheckRollup keeps every check-run on the SHA, so a
-    cancelled in-progress run's `Verify / gate` FAILURE sits next to the
-    later SUCCESS. The PR merge box and `gh pr checks` use the latest of
-    each name; the rollup `state` does not.
+
+def latest_contexts(nodes):
+    """Latest Actions run per workflow, then the newest check of each name.
+
+    GitHub's statusCheckRollup keeps every check-run on the SHA. A cancelled
+    workflow's `Verify / gate` FAILURE stays listed after a new run starts,
+    even before that new run has posted gate. The merge box follows the
+    latest workflow run; the rollup `state` does not.
     """
+    latest_run = {}
+    for i, ctx in enumerate(nodes):
+        if ctx.get("__typename") != "CheckRun":
+            continue
+        name, rid, created = workflow_run(ctx)
+        if not (name and rid):
+            continue
+        sort = (rid, created, i)
+        if name not in latest_run or sort > latest_run[name]:
+            latest_run[name] = sort
     latest = {}
     for i, ctx in enumerate(nodes):
         if ctx.get("__typename") == "CheckRun":
+            wname, rid, created = workflow_run(ctx)
+            if wname and rid:
+                keep = latest_run[wname]
+                if (rid, created) != (keep[0], keep[1]):
+                    continue
             key = ("check", ctx["name"])
             sort = (ctx.get("databaseId") or 0, ctx.get("startedAt") or "", i)
         else:

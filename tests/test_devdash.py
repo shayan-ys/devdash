@@ -252,6 +252,7 @@ def test_native_stack_includes_layers_that_are_not_mine():
 
 def test_fetch_retries_without_stack_field_when_schema_lacks_it(monkeypatch):
     monkeypatch.setattr(devdash, "HAS_STACK", True)
+    monkeypatch.setattr(devdash, "HAS_WORKFLOW_RUN", True)
     queries = []
 
     def fake_run(cmd, timeout=45, env=None):
@@ -277,9 +278,14 @@ def rollup(*nodes, state="FAILURE"):
         "state": state, "contexts": {"nodes": list(nodes)}}}}]}}
 
 
-def check(name, conclusion, status="COMPLETED", database_id=1, started="2026-09-25T16:00:00Z"):
-    return {"__typename": "CheckRun", "name": name, "status": status,
+def check(name, conclusion, status="COMPLETED", database_id=1, started="2026-09-25T16:00:00Z",
+          workflow=None, run=None, created="2026-09-25T16:00:00Z"):
+    node = {"__typename": "CheckRun", "name": name, "status": status,
             "conclusion": conclusion, "databaseId": database_id, "startedAt": started}
+    if workflow and run:
+        node["checkSuite"] = {"workflowRun": {
+            "databaseId": run, "createdAt": created, "workflow": {"name": workflow}}}
+    return node
 
 
 def test_ci_badge_uses_the_latest_run_of_a_check_name():
@@ -317,6 +323,65 @@ def test_ci_badge_a_rerun_in_progress_is_pending_not_the_old_result():
     badge, failed = devdash.ci_badge(pr)
     assert badge.plain == "●ci1"
     assert failed == ""
+
+
+def test_ci_badge_ignores_gate_failure_from_an_older_workflow_run():
+    """Cancelled Verify run posts gate FAILURE; the new Verify run is still in
+    progress and has not posted gate yet."""
+    pr = rollup(
+        check("Verify / gate", "FAILURE", database_id=1, started="2026-09-25T20:38:05Z",
+              workflow="Verify", run=10, created="2026-09-25T20:38:00Z"),
+        check("Verify / clients", "CANCELLED", database_id=2, started="2026-09-25T20:38:01Z",
+              workflow="Verify", run=10, created="2026-09-25T20:38:00Z"),
+        check("Verify / clients", None, status="IN_PROGRESS", database_id=3,
+              started="2026-09-25T20:38:29Z",
+              workflow="Verify", run=20, created="2026-09-25T20:38:14Z"),
+        check("Verify / ios / compile", None, status="IN_PROGRESS", database_id=4,
+              started="2026-09-25T20:38:32Z",
+              workflow="Verify", run=20, created="2026-09-25T20:38:14Z"),
+        check("Infra / gate", "FAILURE", database_id=5, started="2026-09-25T20:38:04Z",
+              workflow="Infra", run=11, created="2026-09-25T20:38:00Z"),
+        check("Infra / gate", "SUCCESS", database_id=6, started="2026-09-25T20:38:37Z",
+              workflow="Infra", run=21, created="2026-09-25T20:38:14Z"),
+        {"__typename": "StatusContext", "context": "CodeRabbit", "state": "SUCCESS",
+         "createdAt": "2026-09-25T20:38:23Z"},
+    )
+    badge, failed = devdash.ci_badge(pr)
+    assert badge.plain == "●ci2"
+    assert failed == ""
+
+
+def test_ci_badge_same_workflow_run_failure_is_still_failure():
+    pr = rollup(
+        check("Verify / gate", "FAILURE", database_id=1, workflow="Verify", run=20),
+        check("Verify / clients", None, status="IN_PROGRESS", database_id=2,
+              workflow="Verify", run=20),
+    )
+    badge, failed = devdash.ci_badge(pr)
+    assert badge.plain == "✗ci1"
+    assert failed == "Verify / gate"
+
+
+def test_fetch_retries_without_workflow_run_when_schema_lacks_it(monkeypatch):
+    monkeypatch.setattr(devdash, "HAS_STACK", False)
+    monkeypatch.setattr(devdash, "HAS_WORKFLOW_RUN", True)
+    queries = []
+
+    def fake_run(cmd, timeout=45, env=None):
+        query = cmd[-1]
+        queries.append(query)
+        if "workflowRun" in query:
+            raise RuntimeError("gh: Field 'workflowRun' doesn't exist on type 'CheckSuite'")
+        nodes = [pr(1, "a", "main")]
+        return json.dumps({"data": {"mine": {"nodes": nodes}}})
+
+    monkeypatch.setattr(devdash, "run", fake_run)
+    mine, review = devdash.fetch_prs([], review_requested=False)
+    assert [p["number"] for p in mine] == [1]
+    assert "workflowRun" not in queries[-1]
+    assert "... on CheckRun { name status conclusion databaseId startedAt }" in queries[-1]
+    devdash.fetch_prs([], review_requested=False)
+    assert len(queries) == 3
 
 
 def test_fetch_does_not_hide_other_errors(monkeypatch):
