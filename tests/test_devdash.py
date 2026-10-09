@@ -79,7 +79,7 @@ def test_config_rejects_mistakes(tmp_path, text):
 def test_key_config_accepts_case_sensitive_names_and_records_an_empty_table(tmp_path):
     cfg = load(tmp_path, '[keys]\nrefresh = "R"\nquit = ""\nfocus = "tab"\n'
                         '[[integrations]]\nname = "t"\ncommand = ["date"]\nkeys = {}\n')
-    assert cfg["keys"] == {"refresh": "R", "quit": "", "focus": "tab"}
+    assert cfg["keys"] == {"refresh": "R", "quit": "", "focus": "tab", "scroll_up": "up", "scroll_down": "down"}
     assert cfg["integrations"][0]["keys"] == {}
     assert cfg["integrations"][0]["has_keys"] is True
 
@@ -766,7 +766,7 @@ def test_focus_cycles_in_screen_order_and_dispatches_only_to_focused_binding():
     bottom = integration("pass", name="bottom", position="bottom", keys={"j": "older"})
     top = integration("pass", name="top", position="top", keys={"k": "newer"})
     st = devdash.State()
-    st.keys = {"refresh": "r", "quit": "q", "focus": "tab"}
+    st.keys = {**devdash.DEFAULTS["keys"], "refresh": "r", "quit": "q", "focus": "tab"}
     st.integrations = [bottom, top]  # config order differs from screen order
     focusable = devdash.focusable_integrations(st)
     assert focusable == [top, bottom]
@@ -786,7 +786,7 @@ def test_each_section_lists_its_own_keys_and_footer_holds_global_keys():
     bottom = integration("pass", name="bottom", position="bottom", keys={"x": "other"})
     st = devdash.State()
     st.show_usage = False
-    st.keys = {"refresh": "R", "quit": "q", "focus": "tab"}
+    st.keys = {**devdash.DEFAULTS["keys"], "refresh": "R", "quit": "q", "focus": "tab"}
     st.integrations = [bottom, top]
     st.focus = top
     console = Console(record=True, width=120)
@@ -799,6 +799,37 @@ def test_each_section_lists_its_own_keys_and_footer_holds_global_keys():
     assert lines.count("R refresh") == 1
     assert lines[lines.index("BOTTOM") + 1] == "x other"
     assert lines[-1] == "q quit · tab focus"
+
+
+def test_a_dashboard_taller_than_the_pane_scrolls_with_its_keys_within_bounds():
+    st = devdash.State()
+    st.show_usage = st.show_review = False
+    st.integrations = [integration("pass")]
+    st.integrations[0].result = ([devdash.line(f"row {i}") for i in range(30)], 0, None)
+
+    def frame():
+        console = Console(record=True, width=80, height=12)
+        console.print(devdash.Dashboard(st), height=12)
+        return console.export_text().splitlines()
+
+    def bar(rows):
+        return "".join(row[79] for row in rows[:10])
+
+    top = frame()
+    assert len(top) == 12 and top[-1].rstrip() == "q quit · up/down scroll"
+    assert top[0].startswith("MY PRS") and bar(top) == "██││││││││"  # 10 of 35 rows visible
+    assert st.width == 79  # content and integrations lay out beside the bar
+    devdash.dispatch_key(st, "down")
+    assert frame()[0].startswith("r refresh")
+    for _ in range(100):
+        devdash.dispatch_key(st, "down")
+    bottom = frame()
+    assert bottom[9].rstrip()[:-1].rstrip() == "row 29" and bar(bottom) == "││││││││██"
+    devdash.dispatch_key(st, "up")  # clamped at the end, so one step up moves at once
+    assert frame()[9].startswith("row 28")
+    for _ in range(100):
+        devdash.dispatch_key(st, "up")
+    assert frame() == top
 
 
 def test_refresh_hint_follows_my_prs_when_review_is_hidden_and_focus_needs_two():

@@ -146,6 +146,8 @@ interval = 60                    # seconds between refreshes
 refresh = "r"                     # "" disables a built-in; Ctrl-C always quits
 quit = "q"
 focus = "tab"
+scroll_up = "up"                  # scroll when the dashboard is taller than the pane
+scroll_down = "down"
 
 [github]
 exclude = ["acme/monorepo", "some-org"]   # "owner/repo", or "owner" for all of its repositories
@@ -203,10 +205,10 @@ Integrations that share a position appear in the order they are listed in the fi
 
 ### Keys, actions, focus, and state
 
-In watch mode, `[keys]` configures the built-in `refresh`, `quit`, and `focus` keys. An empty
-string disables a built-in. Key names are case-sensitive: one printable ASCII character other
-than space, or `up`, `down`, `left`, `right`, `enter`, or `tab`. Arrow keys and Enter/Tab are
-decoded by devdash; Ctrl-C always quits.
+In watch mode, `[keys]` configures the built-in `refresh`, `quit`, `focus`, `scroll_up`, and
+`scroll_down` keys. An empty string disables a built-in. Key names are case-sensitive: one
+printable ASCII character other than space, or `up`, `down`, `left`, `right`, `enter`, or `tab`.
+Arrow keys and Enter/Tab are decoded by devdash; Ctrl-C always quits.
 
 An integration can declare `keys = { j = "newer", k = "older" }`, mapping keys to action names
 that the integration itself understands. Bindings are case-sensitive; they cannot use a key
@@ -215,8 +217,16 @@ integrations can use the same binding; only the focused one receives it. Focus s
 first integration with bindings in screen order, and the configured focus key cycles through
 those integrations. Each section lists its own keys on its last row: an integration's bindings in
 config order under its output, and the refresh key under the last PR section. The bottom row lists
-the keys for the whole dashboard: quit, and the focus key when two or more integrations are
-focusable. The focused section's heading starts with `▸ `.
+the keys for the whole dashboard: quit, the focus key when two or more integrations are
+focusable, and the scroll keys when the dashboard is taller than the pane. The focused section's
+heading starts with `▸ `.
+
+Watch mode draws on the terminal's full-screen view, which has no scrollback, so a dashboard taller
+than the pane scrolls inside devdash: each scroll key press moves it one row, and a scrollbar in the
+rightmost column shows which part is on screen. On the full-screen view, most
+terminals turn mouse-wheel scrolls into arrow keys (devdash also turns on the alternate scroll mode,
+DEC mode 1007, while it runs), so the wheel scrolls the dashboard with the default bindings.
+`--once` prints every row.
 
 Section headings show how long ago the last result was fetched and count down to the next fetch,
 updating every second. Integrations use their own intervals; MY PRS, REVIEW REQUESTED, and USAGE
