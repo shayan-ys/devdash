@@ -37,3 +37,16 @@ order = []  # e.g. ["openai-codex", "anthropic"]
 
 [usage.colors]
 # anthropic = "#d97757"
+
+# Custom integrations: your own sections. Add one [[integrations]] table per section, as many as you like.
+# devdash runs `command` (a list, run without a shell) and shows what it prints. See README "Custom integrations".
+# [[integrations]]
+# name = "weather"            # required, unique; `--no-integration weather` hides it
+# title = "WEATHER"           # heading; default: the name in capitals
+# command = ["curl", "-fsS", "https://wttr.in/?format=3"]
+# position = "bottom"         # "top" | "after-usage" | "after-my-prs" | "bottom"
+# interval = 0                # seconds between runs; 0 = the global interval
+# timeout = 10                # seconds before the command and its children are killed
+# max_rows = 20               # longer output is cut
+# enabled = true
+# env = {}                    # extra environment variables, e.g. { CITY = "Toronto" }
