@@ -1,6 +1,11 @@
+import io
 import json
+import os
+import sys
+import time
 
 import pytest
+from rich.console import Console
 
 import devdash
 
@@ -43,6 +48,18 @@ def test_config_merges_over_defaults(tmp_path):
     "[github]\nreview_requested = 1\n",       # number where a boolean belongs
     "interval = true\n",                      # boolean where a number belongs
     "[usage]\nenabled = \"sometimes\"\n",
+    "[[integrations]]\ncommand = [\"date\"]\n",                                    # no name
+    "[[integrations]]\nname = \"a b\"\ncommand = [\"date\"]\n",                     # name unusable as a flag value
+    "[[integrations]]\nname = \"a\\n\"\ncommand = [\"date\"]\n",                    # trailing newline
+    "[[integrations]]\nname = \"a\"\ncommand = []\n",
+    "[[integrations]]\nname = \"a\"\ncommand = \"date\"\n",                        # a shell string, not argv
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nposition = \"middle\"\n",
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\ntimeout = 0\n",
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\ntimeout = 9223372036854775807\n",  # too big to wait on
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\ninterval = 9223372036854775807\n",
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nenv = { N = 1 }\n",
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nintervl = 5\n",
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\n[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\n",
 ])
 def test_config_rejects_mistakes(tmp_path, text):
     with pytest.raises(SystemExit):
@@ -471,3 +488,167 @@ def test_usage_hides_disabled_credentials_but_shows_authenticated_accounts_witho
 def test_pace_icon_sits_beside_a_value_that_never_moves(points, row):
     icon = devdash.pace_icon(points) if points is not None else None
     assert devdash.meter(0.0, 20, "34%", icon=icon).plain == row
+
+
+# ── custom integrations ───────────────────────────────────────────────────────
+def integration(code, **spec):
+    """An integration whose command is a Python snippet, so tests need no shell tools."""
+    return devdash.Integration({**devdash.INTEGRATION, "name": "t", **spec,
+                                "command": [sys.executable, "-c", code]}, 60)
+
+
+def gone(pid, wait=5):
+    """True once `pid` has exited within `wait` seconds; a zombie waiting to be reaped counts as exited."""
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        state = devdash.subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+        if not state.stdout.strip() or state.stdout.strip().startswith("Z"):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def spawner(pid_file, sleep=60):
+    """Python that starts a sleeping child, records the child's pid, then sleeps itself."""
+    return ("import subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep({sleep})'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+            f"time.sleep({sleep})")
+
+
+def wait_for_pid(pid_file):
+    for _ in range(200):
+        if pid_file.exists() and pid_file.read_text():
+            return int(pid_file.read_text())
+        time.sleep(0.05)
+    pytest.fail("the command never started its child")
+
+
+def test_integration_keeps_colour_and_links_drops_screen_control_and_gets_its_room():
+    ig = integration(
+        "import os; print('\\x1b[2J\\x1b[H\\x1b[1mbold\\x1b[0m '"
+        " + '\\x1b]8;;https://x.test\\x1b\\\\link\\x1b]8;;\\x1b\\\\'"
+        " + ' ' + os.environ['COLUMNS'] + 'x' + os.environ['LINES'] + ' ' + os.environ['GREETING'])",
+        max_rows=7, env={"GREETING": "hi"})
+    ig.poll(42)
+    [row], at, err = ig.result
+    assert err is None and at
+    assert row.plain == "bold link 42x7 hi"
+    assert {(row.plain[s.start:s.end], str(s.style)) for s in row.spans} >= {
+        ("bold", "bold"), ("link", "link https://x.test")}
+
+
+def test_integration_output_cannot_smuggle_terminal_control():
+    hostile = ("\x1b[31mred\x1b[0m \x01\x1b\x9b2J \x1b]8;;https://x.test/\x9b2J\x1b\\bad link\x1b]8;;\x1b\\"
+               " \x1b]8;;\x07\x1b[2J\x1b\\gone\r\n")
+    out = io.StringIO()
+    console = Console(file=out, force_terminal=True, color_system="truecolor", width=80,
+                      _environ={"TERM": "xterm-256color"})
+    for row in devdash.output_rows(hostile, 5):
+        console.print(row)
+    emitted = out.getvalue()
+    assert "\x1b[31m" in emitted  # colour survives
+    for bad in ("\x01", "\x9b", "\x07", "\x1b[2J", "\x1b]8;;https://x.test/"):
+        assert bad not in emitted
+    assert "bad link" in emitted
+
+
+def test_integration_error_line_is_plain_text():
+    ig = integration("import sys; sys.stderr.write('\\x1b[2J\\x1b[31mbad\\x07\\n'); sys.exit(2)")
+    ig.poll(40)
+    assert ig.result[2] == "exit 2: bad"
+
+
+def test_integration_failure_keeps_the_last_good_rows_under_the_error():
+    ig = integration("print('first')")
+    ig.poll(40)
+    ig.command = [sys.executable, "-c", "import sys; sys.exit('boom')"]
+    ig.poll(40)
+    _, at, err = ig.result
+    assert err == "exit 1: boom"
+    assert [r.plain for r in devdash.render_integration(ig, at)] == ["T  fetched 0s ago", "⚠ exit 1: boom", "first"]
+
+
+def test_integration_timeout_kills_the_whole_process_group(tmp_path):
+    pid_file = tmp_path / "child.pid"
+    ig = integration(spawner(pid_file), timeout=3)
+    ig.poll(40)
+    assert ig.result[2] == "timed out after 3s"
+    assert gone(wait_for_pid(pid_file)), "the command's child outlived the timeout"
+
+
+def test_integration_unexpected_capture_error_still_kills_the_command(tmp_path, monkeypatch):
+    pid_file = tmp_path / "child.pid"
+
+    def broken(p, deadline):
+        wait_for_pid(pid_file)
+        raise OSError("selector failed")
+
+    monkeypatch.setattr(devdash, "capture", broken)
+    ig = integration(spawner(pid_file), timeout=60)
+    ig.poll(40)
+    assert ig.result[2] == "selector failed"
+    assert gone(int(pid_file.read_text())), "the command's child outlived the error"
+
+
+def test_integration_output_is_cut_to_max_rows_with_a_count():
+    rows = devdash.output_rows("".join(f"row {i}\n" for i in range(10)) + "\n\n", 4)
+    assert [r.plain for r in rows] == ["row 0", "row 1", "row 2", "… 7 more rows"]
+
+
+def test_integration_flooding_stdout_is_stopped_at_the_output_cap():
+    flood = [sys.executable, "-c", "import sys\nwhile True: sys.stdout.buffer.write(b'x' * 65536)"]
+    p = devdash.subprocess.Popen(flood, stdout=devdash.subprocess.PIPE, stderr=devdash.subprocess.PIPE,
+                                 start_new_session=True)
+    started = time.monotonic()
+    out, err, full = devdash.capture(p, started + 30)
+    assert full and len(out) == devdash.MAX_OUTPUT and err == b""
+    assert p.returncode is not None and time.monotonic() - started < 10  # stopped, not left to time out
+    ig = integration("import sys\nwhile True: sys.stdout.write('row\\n' * 4096)", timeout=30, max_rows=3)
+    ig.poll(40)
+    rows, _, err = ig.result
+    assert err is None and [r.plain for r in rows][:2] == ["row", "row"]
+
+
+def test_integration_keeps_only_the_tail_of_a_flooded_stderr():
+    ig = integration("import sys\nfor _ in range(200): sys.stderr.write('noise ' * 10000 + '\\n')\n"
+                     "sys.exit('the real reason')", timeout=30)
+    p = devdash.subprocess.Popen(ig.command, stdout=devdash.subprocess.PIPE, stderr=devdash.subprocess.PIPE)
+    _, err, _ = devdash.capture(p, time.monotonic() + 30)
+    assert len(err) <= devdash.ERR_TAIL and err.endswith(b"the real reason\n")
+    ig.poll(40)
+    assert ig.result[2] == "exit 1: the real reason"
+
+
+def test_stopping_an_integration_kills_its_running_command_and_children(tmp_path):
+    pid_file = tmp_path / "child.pid"
+    ig = integration(spawner(pid_file), timeout=60)
+    thread = devdash.threading.Thread(target=ig.loop, args=(devdash.State(),), daemon=True)
+    thread.start()
+    try:
+        child = wait_for_pid(pid_file)
+    finally:
+        ig.stop()
+    thread.join(5)
+    assert not thread.is_alive()  # the loop ends instead of waiting out the 60s timeout
+    assert gone(child), "the command's child outlived devdash"
+
+
+def test_integrations_render_in_their_slots_between_built_in_sections():
+    st = devdash.State()
+    st.integrations = []
+    st.show_usage = st.show_review = True
+    st.usage, st.mine, st.review = {"reports": []}, [], []
+    for name in ("bottom", "after-my-prs", "top", "after-usage", "bottom2"):
+        ig = integration("", name=name, position=name.rstrip("2"))
+        ig.result = ([devdash.line(f"{name} body")], 0, None)
+        st.integrations.append(ig)
+    console = Console(record=True, width=50)
+    console.print(devdash.Dashboard(st), height=10_000)
+    heads = [r for r in console.export_text().splitlines() if r.split(" ")[0].isupper() and r.strip()]
+    assert [h.split("  ")[0].strip() for h in heads] == [
+        "TOP", "USAGE", "AFTER-USAGE", "MY PRS 0", "AFTER-MY-PRS", "REVIEW REQUESTED 0", "BOTTOM", "BOTTOM2"]

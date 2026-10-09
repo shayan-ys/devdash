@@ -11,6 +11,8 @@ Sources (both are the tools' own JSON):
                                   and PRs where your review is requested
   - `omp usage --json`   every AI provider's limits and reset times
                                   (optional; shown only when `omp` is installed)
+  - [[integrations]] commands     your own sections: any command whose output
+                                  devdash shows (see the README)
 
 Settings come from a TOML file (see --config); command-line flags win.
 Keys while watching: r = refresh now, q = quit.
@@ -18,15 +20,19 @@ Keys while watching: r = refresh now, q = quit.
 
 import argparse
 import calendar
+import contextlib
 import hashlib
 import json
 import os
 import re
 import select
+import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tomllib
 import tty
@@ -36,7 +42,8 @@ from urllib.request import Request, urlopen
 
 from rich.console import Console, Group
 from rich.live import Live
-from rich.text import Text
+from rich.style import Style
+from rich.text import Span, Text
 
 __version__ = "0.1.0"
 CONSOLE = Console()
@@ -112,6 +119,7 @@ DEFAULTS = {
     "interval": 60,
     "github": {"exclude": [], "review_requested": True, "account": ""},
     "usage": {"enabled": "auto", "refetch_after": 180, "pace": True, "order": [], "names": {}, "colors": {}},
+    "integrations": [],
 }
 REPO_RULE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?$")
 
@@ -152,6 +160,7 @@ def load_config(path, explicit):
     cfg = merge(DEFAULTS, raw)
     if cfg["usage"]["enabled"] not in (True, False, "auto"):
         raise SystemExit("devdash: config key 'usage.enabled' must be true, false, or \"auto\"")
+    cfg["integrations"] = check_integrations(cfg["integrations"])
     return cfg
 
 
@@ -797,10 +806,9 @@ def rule(width):
     return line(("─" * width, RULE))
 
 
-def render_prs(st, width, now):
-    out = [rule(width)] if st.show_usage else []
-    out.append(line(("MY PRS ", H1), (str(len(st.mine)), H1),
-                    ("  fetched " + dur(now - st.prs_at) + " ago", META) if st.prs_at else ""))
+def render_mine(st, width, now):
+    out = [line(("MY PRS ", H1), (str(len(st.mine)), H1),
+                ("  fetched " + dur(now - st.prs_at) + " ago", META) if st.prs_at else "")]
     if st.prs_err:
         out.append(line((f"⚠ {st.prs_err}", BAD)))
     for repo, groups in group_mine(st.mine).items():
@@ -823,9 +831,11 @@ def render_prs(st, width, now):
                     state = pr.get("state", "").lower()
                     note = "✓merged" if state == "merged" else state
                     out += title_rows(pr, width, bar, dim=True, note=note)[:1]
-    if not st.show_review:
-        return out
-    out += [Text(), rule(width), line(("REVIEW REQUESTED ", H1), (str(len(st.review)), H1)), Text()]
+    return out
+
+
+def render_review(st, width, now):
+    out = [line(("REVIEW REQUESTED ", H1), (str(len(st.review)), H1)), Text()]
     if not st.review:
         out.append(line(("nothing waiting on you", META)))
     for ri, pr in enumerate(sorted(st.review, key=lambda p: p["updatedAt"], reverse=True)):
@@ -839,6 +849,220 @@ def render_prs(st, width, now):
             lead.append("  re-requested", style=STACK)
         out += title_rows(pr, width) + [lead, status_row(pr, st.me)]
     return out
+
+
+# ── custom integrations ───────────────────────────────────────────────────────
+# An integration is any command that prints its section body to stdout. devdash
+# runs it without a shell, on its own thread and schedule, with no stdin and a
+# timeout, and shows its last good output; colours and hyperlinks are kept, and
+# every other escape sequence is dropped.
+POSITIONS = ("top", "after-usage", "after-my-prs", "bottom")
+INTEGRATION = {"name": "", "title": "", "command": [], "position": "bottom", "enabled": True,
+               "interval": 0, "timeout": 10, "max_rows": 20, "env": {}}
+NAME_RULE = re.compile(r"[A-Za-z0-9_.-]+")
+MAX_OUTPUT = 64 * 1024  # bytes of standard output devdash keeps; a command that prints more is stopped
+ERR_TAIL = 4 * 1024     # bytes of standard error devdash keeps, the newest ones, for the error line
+MAX_SECONDS = DAY       # upper bound for interval and timeout; threading and select reject huge waits
+# C0 controls except tab and newline, DEL, and C1 controls: what is left of escape sequences
+# that Rich does not decode. Each one becomes U+FFFD so styled spans keep their offsets.
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def check_integrations(items):
+    """Validate the [[integrations]] tables, disabled ones included, and fill in their defaults."""
+    specs, names = [], set()
+    for i, raw in enumerate(items):
+        if not isinstance(raw, dict):
+            raise SystemExit(f"devdash: integrations[{i}] must be a table")
+        spec = merge(INTEGRATION, raw, f"integrations[{i}].")
+        name = spec["name"]
+        if not isinstance(name, str) or not NAME_RULE.fullmatch(name):
+            raise SystemExit(f"devdash: integrations[{i}].name is required: letters, digits, '.', '_' or '-'")
+        if name in names:
+            raise SystemExit(f"devdash: integration name '{name}' is used twice")
+        names.add(name)
+        where = f"devdash: integration '{name}':"
+        cmd = spec["command"]
+        if not cmd or not all(isinstance(a, str) and a for a in cmd):
+            raise SystemExit(f"{where} command must be a non-empty list of strings")
+        if not isinstance(spec["title"], str):
+            raise SystemExit(f"{where} title must be a string")
+        if spec["position"] not in POSITIONS:
+            raise SystemExit(f"{where} position must be one of {', '.join(POSITIONS)}")
+        if not 0 <= spec["interval"] <= MAX_SECONDS:
+            raise SystemExit(f"{where} interval must be 0 (the global interval) to {MAX_SECONDS}")
+        if not 1 <= spec["timeout"] <= MAX_SECONDS:
+            raise SystemExit(f"{where} timeout must be 1 to {MAX_SECONDS}")
+        if spec["max_rows"] < 1:
+            raise SystemExit(f"{where} max_rows must be 1 or more")
+        if not all(isinstance(v, str) for v in spec["env"].values()):
+            raise SystemExit(f"{where} env values must be strings")
+        specs.append(spec)
+    return specs
+
+
+def output_rows(text, max_rows):
+    """A command's ANSI output as screen rows, trailing blank rows dropped, at most `max_rows`.
+
+    Only SGR styles and OSC 8 links survive: Rich decodes those, the leftover control
+    characters are replaced, and a link whose target holds a control character is dropped."""
+    body = Text.from_ansi(text.replace("\r\n", "\n"))
+    body.plain = CONTROL.sub("\ufffd", body.plain)
+    body.spans = [Span(s.start, s.end, s.style.update_link(None))
+                  if isinstance(s.style, Style) and s.style.link and CONTROL.search(s.style.link) else s
+                  for s in body.spans]
+    body.expand_tabs()
+    rows = [line(r) for r in body.split("\n")]
+    while rows and not rows[-1].plain.strip():
+        rows.pop()
+    if len(rows) > max_rows:
+        hidden = len(rows) - max_rows + 1
+        rows = rows[:max_rows - 1] + [line((f"… {hidden} more rows", META))]
+    return rows
+
+
+def plain_line(text):
+    """`text` as one row of plain characters, for messages built from a command's stderr."""
+    return CONTROL.sub("", Text.from_ansi(text).plain.replace("\n", " "))
+
+
+def kill_group(p):
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(p.pid, signal.SIGKILL)
+    p.wait()
+
+
+def capture(p, deadline):
+    """(stdout, stderr tail, stopped for size) of `p`, holding at most MAX_OUTPUT + ERR_TAIL bytes.
+
+    Reads both pipes as data arrives, so a command that floods either one cannot grow
+    devdash's memory. Stops the process group once stdout passes MAX_OUTPUT, or raises
+    TimeoutExpired after stopping it at `deadline`.
+    """
+    out, err = bytearray(), bytearray()
+    full = False
+    with selectors.DefaultSelector() as sel:
+        sel.register(p.stdout, selectors.EVENT_READ, out)
+        sel.register(p.stderr, selectors.EVENT_READ, err)
+        while sel.get_map() and not full:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                kill_group(p)
+                raise subprocess.TimeoutExpired(p.args, 0)
+            for key, _ in sel.select(left):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                elif key.data is err:
+                    err += chunk
+                    del err[:-ERR_TAIL]
+                else:
+                    out += chunk
+                    full = len(out) > MAX_OUTPUT
+    if full:
+        kill_group(p)
+        return out[:MAX_OUTPUT], err, True
+    try:  # both pipes are closed, but the command may still be running
+        p.wait(max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        raise
+    return out, err, False
+
+
+class Integration:
+    """One configured section. Its own thread publishes `result`; the render thread reads it."""
+
+    def __init__(self, spec, interval):
+        self.name = spec["name"]
+        self.title = spec["title"] or spec["name"].upper()
+        self.command = [os.path.expanduser(spec["command"][0]), *spec["command"][1:]]
+        self.position = spec["position"]
+        self.interval = min(spec["interval"] or interval, MAX_SECONDS)  # the global interval is unbounded
+        self.timeout = spec["timeout"]
+        self.max_rows = spec["max_rows"]
+        self.env = spec["env"]
+        self.result = ([], 0, None)  # (rows, fetched at, error)
+        self.wake = threading.Event()
+        # stop() and fetch() share the running command under this lock, so a command
+        # started while devdash quits is either never started or killed.
+        self.lock = threading.Lock()
+        self.proc = None
+        self.stopped = False
+
+    def fetch(self, width):
+        # COLUMNS and LINES tell the command how much room its section has.
+        env = {**os.environ, **self.env, "COLUMNS": str(width), "LINES": str(self.max_rows)}
+        with self.lock:
+            if self.stopped:
+                raise RuntimeError("stopped")
+            try:
+                # A new session puts the command and its children in one process group,
+                # so a timeout kills them all; DEVNULL keeps it off devdash's keyboard.
+                p = subprocess.Popen(self.command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, env=env, start_new_session=True)
+            except OSError as e:
+                raise RuntimeError(f"cannot run {self.command[0]}: {e.strerror}") from None
+            self.proc = p
+        try:
+            out, err, full = capture(p, time.monotonic() + self.timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"timed out after {self.timeout}s") from None
+        except BaseException:
+            if p.returncode is None:  # never leave a command running behind an unexpected error
+                kill_group(p)
+            raise
+        finally:
+            with self.lock:
+                self.proc = None
+            p.stdout.close()
+            p.stderr.close()
+        if p.returncode and not full:  # a command stopped for printing too much still shows its output
+            tail = err.decode(errors="replace").strip().splitlines()
+            raise RuntimeError(f"exit {p.returncode}" + (f": {tail[-1]}" if tail else ""))
+        return output_rows(out.decode(errors="replace"), self.max_rows)
+
+    def poll(self, width):
+        """Run the command once. A failure keeps the last good rows on screen under the error.
+
+        `result` is (rows, fetched at, error), replaced as one tuple so a frame never mixes two runs."""
+        try:
+            self.result = (self.fetch(width), time.time(), None)
+        except Exception as e:  # one broken integration must never stop the dashboard
+            rows, at, _ = self.result
+            self.result = (rows, at, plain_line(str(e))[:80])
+
+    def loop(self, st):
+        while not self.stopped:
+            self.wake.clear()
+            self.poll(st.width)
+            self.wake.wait(self.interval)
+
+    def stop(self):
+        """Stop polling and kill a running command with everything it started.
+
+        The command runs in its own session, so it would outlive devdash otherwise."""
+        with self.lock:
+            self.stopped = True
+            p = self.proc
+        self.wake.set()
+        if p is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(p.pid, signal.SIGKILL)
+
+
+def render_integration(ig, now):
+    rows, at, err = ig.result
+    if at:
+        age = ("  fetched " + dur(now - at) + " ago", META)
+    else:
+        age = ("  loading…", META) if not err else ""
+    out = [line((ig.title, H1), age)]
+    if err:
+        out.append(line((f"⚠ {err}", BAD)))
+    return out + rows
+
+
 
 
 # ── loop ──────────────────────────────────────────────────────────────────────
@@ -860,6 +1084,8 @@ class State:
     show_review = True
     show_pace = True
     excluded = []
+    integrations = []
+    width = 80  # the pane width at the last render, passed to integrations as COLUMNS
 
 
 class Dashboard:
@@ -870,11 +1096,22 @@ class Dashboard:
 
     def __rich_console__(self, console, options):
         now = time.time()
+        st = self.st
         width = options.max_width
-        rows = render_usage(self.st, width, now) + [Text()] if self.st.show_usage else []
-        rows += render_prs(self.st, width, now)
-        foot = f"{time.strftime('%H:%M:%S')} · every {self.st.interval}s · r refresh · q quit"
-        if self.st.busy:
+        if width != st.width:  # integrations lay out for the new width now, not at their next run
+            st.width = width
+            for ig in st.integrations:
+                ig.wake.set()
+        slot = {p: [render_integration(ig, now) for ig in st.integrations if ig.position == p]
+                for p in POSITIONS}
+        sections = slot["top"] + ([render_usage(st, width, now)] if st.show_usage else [])
+        sections += slot["after-usage"] + [render_mine(st, width, now)] + slot["after-my-prs"]
+        sections += ([render_review(st, width, now)] if st.show_review else []) + slot["bottom"]
+        rows = list(sections[0])
+        for rows_of in sections[1:]:
+            rows += [Text(), rule(width), *rows_of]
+        foot = f"{time.strftime('%H:%M:%S')} · every {st.interval}s · r refresh · q quit"
+        if st.busy:
             foot = "refreshing… · " + foot
         height = options.height or console.height
         if len(rows) > height - 2:
@@ -928,6 +1165,9 @@ def parse_args():
                          "adds to github.exclude")
     ap.add_argument("--no-review", action="store_true", help="hide the REVIEW REQUESTED section")
     ap.add_argument("--no-usage", action="store_true", help="hide the USAGE section")
+    ap.add_argument("--no-integration", action="append", default=[], metavar="NAME",
+                    help="hide the custom integration NAME; repeatable")
+    ap.add_argument("--no-integrations", action="store_true", help="hide every custom integration")
     # Some providers' usage endpoints rate-limit hard, and omp drops a provider
     # instead of keeping its last report, so forced refetches are rationed.
     ap.add_argument("--usage-every", type=int, metavar="SECONDS",
@@ -962,6 +1202,13 @@ def main():
     usage_every = args.usage_every if args.usage_every is not None else usage["refetch_after"]
     if args.cached or usage_every == 0:
         usage_every = None
+    hidden = set(args.no_integration)
+    unknown = hidden - {s["name"] for s in cfg["integrations"]}
+    if unknown:
+        raise SystemExit(f"devdash: --no-integration: no integration named '{sorted(unknown)[0]}'")
+    if not args.no_integrations:
+        st.integrations = [Integration(s, st.interval) for s in cfg["integrations"]
+                           if s["enabled"] and s["name"] not in hidden]
 
     # Start from omp's cache so the first frame never waits on, or loses, a
     # refetch; the saved last good reads fill any provider omp dropped.
@@ -979,16 +1226,42 @@ def main():
         raise SystemExit(f"devdash: gh is not signed in{who} ({e}){hint}") from None
     pool = ThreadPoolExecutor(2)
 
-    if args.once or not sys.stdin.isatty():
-        refresh(st, pool, usage_every, False)
-        CONSOLE.print(Dashboard(st), height=10_000)
-        return
+    st.width = CONSOLE.width
+    # Closing the pane sends SIGHUP; exit through `finally` so running integrations are killed.
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, lambda *_: sys.exit(0))
+    try:
+        if args.once or not sys.stdin.isatty():
+            print_once(st, pool, usage_every)
+        else:
+            watch(st, pool, usage_every)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for ig in st.integrations:
+            ig.stop()
 
+
+def print_once(st, pool, usage_every):
+    runner = ThreadPoolExecutor(max(1, len(st.integrations)))
+    try:
+        jobs = [runner.submit(ig.poll, st.width) for ig in st.integrations]
+        refresh(st, pool, usage_every, False)
+        for job in jobs:
+            job.result()
+    finally:
+        runner.shutdown(wait=False)  # on an early exit, main stops the commands these workers wait on
+    CONSOLE.print(Dashboard(st), height=10_000)
+
+
+def watch(st, pool, usage_every):
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     tty.setcbreak(fd)
-    force = False
     try:
+        for ig in st.integrations:
+            threading.Thread(target=ig.loop, args=(st,), daemon=True, name=f"integration-{ig.name}").start()
+        force = False
         with Live(Dashboard(st), console=CONSOLE, screen=True, refresh_per_second=1):
             while True:
                 refresh(st, pool, usage_every, force)
@@ -1001,9 +1274,9 @@ def main():
                             return
                         if key == "r":
                             force = True
+                            for ig in st.integrations:
+                                ig.wake.set()
                             break
-    except KeyboardInterrupt:
-        pass
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 

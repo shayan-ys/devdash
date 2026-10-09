@@ -29,6 +29,8 @@ named `devdash`.
   `nous` credential. Hidden when `omp` is not installed. Weekly and monthly bars show a pace
   icon (`>>` too fast, `<<` too slow, `|` on pace).
 - **Hide what you do not want to see.** Exclude single repositories or whole organizations.
+- **Your own sections.** Add as many custom integrations as you like (weather, service health,
+  a tutor, a build queue): any command whose output devdash shows in a slot you choose.
 
 PR numbers are clickable in terminals that support hyperlinks.
 
@@ -39,6 +41,7 @@ PR numbers are clickable in terminals that support hyperlinks.
 - [Install](#install)
 - [Usage](#usage)
 - [Configuration](#configuration)
+- [Custom integrations](#custom-integrations)
 - [Troubleshooting](#troubleshooting)
 - [Related projects](#related-projects)
 - [Contributing](#contributing)
@@ -78,6 +81,7 @@ devdash --once                     # print one frame and exit
 devdash --exclude acme/monorepo    # hide one repository
 devdash --exclude acme             # hide every repository of a user or organization
 devdash --no-review --no-usage     # show only your own PRs
+devdash --no-integration weather   # hide one custom integration (--no-integrations hides all)
 devdash --profile personal --once  # show usage from the personal omp profile
 devdash --github alice             # MY PRS / REVIEW REQUESTED for this gh login
 devdash --help                     # all flags
@@ -159,6 +163,95 @@ Command-line flags override the file, and each `--exclude` adds to `github.exclu
 key or a value of the wrong type stops devdash with an error, so a typo cannot fail silently.
 [`config.example.toml`](config.example.toml) lists every key with its default.
 
+## Custom integrations
+
+An integration is your own section. Declare one `[[integrations]]` table per section; there is
+no limit on how many. devdash runs each one's command and shows what it prints to standard
+output, under a heading:
+
+```toml
+[[integrations]]
+name = "weather"                    # required; unique; used by --no-integration
+title = "WEATHER"                    # heading; defaults to the name in capitals
+command = ["curl", "-fsS", "https://wttr.in/Toronto?format=3"]
+position = "top"                     # top, after-usage, after-my-prs, or bottom (the default)
+interval = 900                       # seconds between runs, up to 86400; 0 (the default) uses the global interval
+timeout = 10                         # seconds, 1 to 86400, before the command and its children are killed
+max_rows = 20                        # longer output is cut, ending in "… N more rows"
+enabled = true                       # false keeps the table but hides the section
+env = { WTTR_LANG = "en" }           # extra environment variables for the command
+```
+
+Integrations that share a position appear in the order they are listed in the file.
+
+**What a command must do.** Print the section body and exit with status 0. Any language works:
+a shell script, a Python file, or an existing CLI with a one-shot mode. devdash sets `COLUMNS`
+to the pane width and `LINES` to `max_rows`, so the command can fit its output to the room it has;
+when the pane is resized, devdash runs every waiting integration again at once (one that is
+already running finishes first). Colors (SGR) and hyperlinks (OSC 8) are kept. Cursor movement,
+screen clears, and every other escape sequence are dropped, and any other control character
+shows as `�`. A link whose target contains a control character loses its link. Rows longer
+than the pane end in `…`. Trailing blank rows are removed. devdash keeps
+the first 64 KiB of standard output: a command that prints more is stopped there, and that part
+is shown. Of standard error it keeps only the last 4 KiB, so a noisy command cannot use up memory.
+
+**Failures.** A non-zero exit, a timeout, or a command that cannot start shows `⚠` and the
+reason under the heading: for a non-zero exit, the last line of its standard error, as plain
+text. The last good output stays on screen below the error, and the heading tells you how old it is.
+
+**Safety.** An integration runs with your user's rights. Only list commands you trust.
+devdash runs the `command` list directly, without a shell; to use pipes or `&&`, write
+`["sh", "-c", "…"]` or point at a script. The first element may start with `~`. Each
+integration runs on its own thread, with no standard input and in its own process group, so a
+slow or hung command cannot freeze the dashboard or read your keystrokes. A timeout kills the
+command together with every process it started that stayed in its process group; a program
+that starts its own session (a daemon, for example) escapes this. Quitting devdash, with `q`,
+Ctrl-C, or by closing the pane, kills running commands the same way. Pressing `r` runs every
+waiting integration again at once. With `--once`, devdash runs all integrations in parallel,
+each within its own timeout, alongside the built-in GitHub and usage reads.
+
+### Example: prompt-tutor
+
+[prompt-tutor](https://github.com/shayan-ys/prompt-tutor) reviews the English of the prompts you
+send to omp, and its Watcher shows the latest Review. Its one-shot mode, `prompt-tutor --once`,
+prints one frame sized to `COLUMNS` and `LINES` and exits, so it works as an integration as is.
+
+1. Install prompt-tutor and put its Watcher on your `PATH`. Until prompt-tutor's first build is
+   merged into its `main` branch, `main` holds only planning documents, so install the
+   `build/v0` branch:
+
+   ```sh
+   omp plugin install 'github:shayan-ys/prompt-tutor#build/v0'
+   ```
+
+   Restart omp, then run `/prompt-tutor install-watcher` inside omp. After the merge, follow
+   prompt-tutor's [install instructions](https://github.com/shayan-ys/prompt-tutor#install),
+   which install from `main`.
+2. Check that the frame fits a narrow pane:
+
+   ```sh
+   COLUMNS=50 LINES=16 prompt-tutor --once < /dev/null | cat
+   ```
+
+3. Add it to your devdash config (`~/.config/devdash/config.toml` by default), here at the bottom:
+
+   ```toml
+   [[integrations]]
+   name = "prompt-tutor"
+   title = "PROMPT TUTOR"
+   command = ["prompt-tutor", "--once"]
+   position = "bottom"
+   max_rows = 16
+   ```
+
+   If devdash shows `⚠ cannot run prompt-tutor`, the Watcher link is not on the `PATH` that
+   devdash sees; use its full path, for example `command = ["~/.local/bin/prompt-tutor", "--once"]`.
+4. Run `devdash`. The section updates on the global interval; press `r` to refresh it after a
+   prompt, and use `devdash --no-integration prompt-tutor` to hide it for one run.
+
+The frame's last row lists the Watcher's own keys (`j/k`, `s`, `q`). They work only in the
+standalone `prompt-tutor` Watcher, not inside devdash.
+
 ## Troubleshooting
 
 **`gh is not signed in`.** Run `gh auth login`. With more than one account, pass `--github USER`
@@ -185,6 +278,14 @@ the dashboard cache. Check that the key belongs to the selected profile and rema
 `https://portal.nousresearch.com/api/oauth/account` with `omp --profile NAME token nous-portal`
 (or `nous`). A browser or Hermes login is not visible to omp; store the Portal credential in
 the selected omp profile first. Inference keys that cannot read the account API are omitted.
+
+**An integration shows `⚠ exit 127` or `cannot run …`.** devdash could not find the command.
+Use an absolute path, or check that the program is on the `PATH` that devdash sees.
+
+**An integration's layout is broken.** The command probably draws for a full-screen terminal.
+Run it as devdash does, for example `COLUMNS=50 LINES=20 your-command < /dev/null | cat`, and
+check that it fits. A command that sizes itself from the terminal must fall back to `COLUMNS`
+and `LINES` when its output is a pipe.
 
 ## Related projects
 

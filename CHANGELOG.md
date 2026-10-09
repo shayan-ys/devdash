@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Custom integrations: any number of `[[integrations]]` sections, each a command whose
+  output devdash shows at `top`, `after-usage`, `after-my-prs`, or `bottom`. Each runs on
+  its own thread and schedule, with a timeout that kills its whole process group, and a
+  failure keeps its last good output on screen under the error. `--no-integration NAME`
+  hides one integration and `--no-integrations` hides all of them.
 - `--profile NAME` selects the matching isolated omp profile for usage and cached readings;
   only that profile's authenticated providers appear. Provider headings include that
   provider's account email in white, for example `Codex (user@example.com)`.
