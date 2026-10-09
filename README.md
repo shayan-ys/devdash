@@ -180,11 +180,6 @@ timeout = 10                         # seconds, 1 to 86400, before the command a
 max_rows = 20                        # longer output is cut, ending in "… N more rows"
 enabled = true                       # false keeps the table but hides the section
 env = { WTTR_LANG = "en" }           # extra environment variables for the command
-
-[[integrations]]
-name = "prompt-tutor"
-title = "PROMPT TUTOR"
-command = ["prompt-tutor", "--once"]
 ```
 
 Integrations that share a position appear in the order they are listed in the file.
@@ -214,6 +209,41 @@ that starts its own session (a daemon, for example) escapes this. Quitting devda
 Ctrl-C, or by closing the pane, kills running commands the same way. Pressing `r` runs every
 waiting integration again at once. With `--once`, devdash runs all integrations in parallel,
 each within its own timeout, alongside the built-in GitHub and usage reads.
+
+### Example: prompt-tutor
+
+[prompt-tutor](https://github.com/shayan-ys/prompt-tutor) reviews the English of the prompts you
+send to omp, and its Watcher shows the latest Review. Its one-shot mode, `prompt-tutor --once`,
+prints one frame sized to `COLUMNS` and `LINES` and exits, so it works as an integration as is.
+
+1. Install prompt-tutor and put its Watcher on your `PATH`, as its
+   [install instructions](https://github.com/shayan-ys/prompt-tutor#install) describe
+   (`omp plugin install github:shayan-ys/prompt-tutor`, restart omp, then run
+   `/prompt-tutor install-watcher` inside omp).
+2. Check that the frame fits a narrow pane:
+
+   ```sh
+   COLUMNS=50 LINES=16 prompt-tutor --once < /dev/null | cat
+   ```
+
+3. Add it to your devdash config (`~/.config/devdash/config.toml` by default), here at the bottom:
+
+   ```toml
+   [[integrations]]
+   name = "prompt-tutor"
+   title = "PROMPT TUTOR"
+   command = ["prompt-tutor", "--once"]
+   position = "bottom"
+   max_rows = 16
+   ```
+
+   If devdash shows `⚠ cannot run prompt-tutor`, the Watcher link is not on the `PATH` that
+   devdash sees; use its full path, for example `command = ["~/.local/bin/prompt-tutor", "--once"]`.
+4. Run `devdash`. The section updates on the global interval; press `r` to refresh it after a
+   prompt, and use `devdash --no-integration prompt-tutor` to hide it for one run.
+
+The frame's last row lists the Watcher's own keys (`j/k`, `s`, `q`). They work only in the
+standalone `prompt-tutor` Watcher, not inside devdash.
 
 ## Troubleshooting
 
