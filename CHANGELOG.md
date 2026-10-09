@@ -17,6 +17,9 @@ All notable changes to this project are documented here. The format follows
   both with and without a scheduled interval.
 - Configurable, case-sensitive built-in keys and per-integration actions, with private state files in watch mode,
   per-section key hints, and fetch countdowns on section headings.
+- A dashboard taller than the pane scrolls with `up`/`down` (config: `keys.scroll_up`,
+  `keys.scroll_down`) and with the mouse wheel through alternate scroll mode, and shows a
+  scrollbar, instead of cutting the bottom off.
 - `--profile NAME` selects the matching isolated omp profile for usage and cached readings;
   only that profile's authenticated providers appear. Provider headings include that
   provider's account email in white, for example `Codex (user@example.com)`.

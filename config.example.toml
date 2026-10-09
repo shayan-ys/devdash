@@ -10,6 +10,8 @@ interval = 60
 refresh = "r"
 quit = "q"
 focus = "tab"
+scroll_up = "up"      # scroll a dashboard taller than the pane; the mouse wheel sends these too
+scroll_down = "down"
 
 [github]
 # Repositories to hide from both PR sections. An entry is "owner/repo" for one repository,

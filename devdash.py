@@ -123,7 +123,7 @@ DEFAULTS = {
     "interval": 60,
     "github": {"exclude": [], "review_requested": True, "account": ""},
     "usage": {"enabled": "auto", "refetch_after": 180, "pace": True, "order": [], "names": {}, "colors": {}},
-    "keys": {"refresh": "r", "quit": "q", "focus": "tab"},
+    "keys": {"refresh": "r", "quit": "q", "focus": "tab", "scroll_up": "up", "scroll_down": "down"},
     "integrations": [],
 }
 REPO_RULE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?$")
@@ -137,7 +137,7 @@ def valid_key_name(key):
 
 def check_builtin_keys(keys):
     enabled = {}
-    for name in ("refresh", "quit", "focus"):
+    for name in DEFAULTS["keys"]:
         key = keys[name]
         if not isinstance(key, str):
             raise SystemExit(f"devdash: config key 'keys.{name}' must be a key name or an empty string")
@@ -1350,6 +1350,10 @@ def dispatch_key(st, key):
         result = "refresh"
     elif key == st.keys["focus"] and st.keys["focus"]:
         focus_next(st)
+    elif key == st.keys["scroll_up"] and st.keys["scroll_up"]:
+        st.scroll = max(0, st.scroll - 1)
+    elif key == st.keys["scroll_down"] and st.keys["scroll_down"]:
+        st.scroll += 1  # Dashboard clamps it to the content at the next render
     elif st.focus is not None and key in st.focus.keys:
         st.focus.queue_action(st.focus.keys[key])
     if st.live is not None:
@@ -1394,6 +1398,7 @@ class State:
     width = 80  # the pane width at the last render, passed to integrations as COLUMNS
     keys = DEFAULTS["keys"]
     focus = None
+    scroll = 0  # rows hidden above the window when the dashboard is taller than the pane
     live = None
     global_next_fetch = None
     prs_fetching = False
@@ -1401,24 +1406,51 @@ class State:
 
 
 class Dashboard:
-    """Rebuilt on every Live refresh, so resizes and countdowns stay current."""
+    """Rebuilt on every Live refresh, so resizes and countdowns stay current.
 
-    def __init__(self, st):
+    With `window`, a dashboard taller than the pane shows the rows at `st.scroll` beside a scrollbar."""
+
+    def __init__(self, st, window=True):
         self.st = st
+        self.window = window
 
     def __rich_console__(self, console, options):
         now = time.time()
         monotonic_now = time.monotonic()
         st = self.st
+        keys = st.keys
+        room = max(1, (options.height or console.height) - 2)
         width = options.max_width
+        rows = self.rows(width, now, monotonic_now)
+        if self.window and len(rows) > room:  # lay out one column narrower to make room for the scrollbar
+            width -= 1
+            rows = self.rows(width, now, monotonic_now)
+        overflow = self.window and len(rows) > room  # data can change between the two layouts
         if width != st.width:  # integrations lay out for the new width now, not at their next run
             st.width = width
             for ig in st.integrations:
                 ig.request_refresh(after_current=True)
+        hints = [f"{keys['quit']} quit"] if keys["quit"] else []
+        if len(focusable_integrations(st)) >= 2 and keys["focus"]:
+            hints.append(f"{keys['focus']} focus")
+        scroll_keys = "/".join(k for k in (keys["scroll_up"], keys["scroll_down"]) if k)
+        if overflow and scroll_keys:
+            hints.append(f"{scroll_keys} scroll")
+        # The key loop changes st.scroll on another thread: read it once, clamp it, and use only that.
+        scroll = max(0, min(st.scroll, len(rows) - room)) if overflow else 0
+        st.scroll = scroll
+        if overflow:
+            rows = [with_bar(row, width, bar)
+                    for row, bar in zip(rows[scroll:scroll + room],
+                                        scrollbar(room, len(rows), scroll), strict=True)]
+        yield Group(*rows, Text(), line((" · ".join(hints), META)))
+
+    def rows(self, width, now, monotonic_now):
+        st = self.st
+        keys = st.keys
         slot = {p: [render_integration(ig, now, ig is st.focus, monotonic_now)
                     for ig in st.integrations if ig.position == p]
                 for p in POSITIONS}
-        keys = st.keys
         mine = render_mine(st, width, now, monotonic_now)
         review = render_review(st, width, now, monotonic_now) if st.show_review else None
         if keys["refresh"]:  # the hint sits under the last PR section
@@ -1429,15 +1461,22 @@ class Dashboard:
         rows = list(sections[0])
         for rows_of in sections[1:]:
             rows += [Text(), rule(width), *rows_of]
-        hints = [f"{keys['quit']} quit"] if keys["quit"] else []
-        if len(focusable_integrations(st)) >= 2 and keys["focus"]:
-            hints.append(f"{keys['focus']} focus")
-        foot = " · ".join(hints)
-        height = options.height or console.height
-        if len(rows) > height - 2:
-            hidden = len(rows) - (height - 3)
-            rows = rows[: height - 3] + [line((f"… {hidden} more rows", META))]
-        yield Group(*rows, Text(), line((foot, META)))
+        return rows
+
+
+def scrollbar(room, total, scroll):
+    """One character per visible row: a thumb sized and placed by the visible share of `total`."""
+    thumb = max(1, room * room // total)
+    start = round(scroll * (room - thumb) / (total - room))
+    return ["█" if start <= i < start + thumb else "│" for i in range(room)]
+
+
+def with_bar(row, width, bar):
+    """`row` cut or padded to `width` cells, then the scrollbar character."""
+    row = row.copy()
+    row.truncate(width, overflow="ellipsis", pad=True)
+    row.append(bar, RULE if bar == "│" else META)
+    return row
 
 
 def refresh(st, usage_every, force):
@@ -1600,14 +1639,20 @@ def print_once(st, usage_every):
             job.result()
     finally:
         runner.shutdown(wait=False)  # on an early exit, main stops the commands these workers wait on
-    CONSOLE.print(Dashboard(st), height=10_000)
+    CONSOLE.print(Dashboard(st, window=False))
 
 
 def watch(st, usage_every):
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     tty.setcbreak(fd)
+    # Alternate scroll mode: the mouse wheel sends arrow keys on the full-screen view, which
+    # has no scrollback, so the wheel scrolls the dashboard. Save the mode and restore it on exit.
+    scroll_mode = CONSOLE.is_terminal
     try:
+        if scroll_mode:
+            CONSOLE.file.write("\x1b[?1007s\x1b[?1007h")
+            CONSOLE.file.flush()
         with integration_state_files(st):
             focusable = focusable_integrations(st)
             st.focus = focusable[0] if focusable else None
@@ -1669,7 +1714,12 @@ def watch(st, usage_every):
                 for ig in st.integrations:
                     ig.stop()
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        finally:
+            if scroll_mode:
+                CONSOLE.file.write("\x1b[?1007r")
+                CONSOLE.file.flush()
 
 
 if __name__ == "__main__":
