@@ -207,8 +207,8 @@ the keys for the whole dashboard: quit, and the focus key when two or more integ
 focusable. The focused section's heading starts with `▸ `.
 
 Section headings show how long ago the last result was fetched and count down to the next fetch,
-updating every second. Integrations use their own intervals; MY PRS uses the global interval, and
-USAGE follows its effective usage-refetch cadence. While a section is fetching, its heading says
+updating every second. Integrations use their own intervals; MY PRS, REVIEW REQUESTED, and USAGE
+use the global interval. While a section is fetching, its heading says
 `fetching…`. `--once` shows no countdown.
 
 Global PR and usage refreshes run in the background, so input remains responsive. Pressing `r`

@@ -116,6 +116,12 @@ def test_decode_keys_keeps_partial_sequences_until_the_next_read():
     assert decoded == ["up"] and pending == b""
 
 
+def test_decode_keys_drops_escapes_with_intermediate_bytes_whole():
+    assert devdash.decode_keys(b"\x1b(Bq\x1b#8j\x1bxk") == (["q", "j", "k"], b"")
+    decoded, pending = devdash.decode_keys(b"\x1b(")
+    assert decoded == [] and pending == b"\x1b("
+    assert devdash.decode_keys(b"Bj", pending) == (["j"], b"")
+
 
 def test_missing_config_is_an_error_only_when_named(tmp_path):
     assert devdash.load_config(str(tmp_path / "none.toml"), explicit=False) == devdash.DEFAULTS

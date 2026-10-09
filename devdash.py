@@ -533,27 +533,11 @@ def section_status(fetched_at, fetching, next_fetch_at, now, monotonic_now):
     return ("  " + " · ".join(parts), META) if parts else ""
 
 
-def usage_next_fetch(st, now, monotonic_now):
-    deadline = st.global_next_fetch
-    if deadline is None or st.usage_every is None:
-        return deadline
-    since_invalidation = now - st.usage_inval_at
-    age = oldest_read(st.usage)
-    delay = max(0, 60 - since_invalidation,
-                st.usage_every - age if age is not None else 0)
-    eligible = monotonic_now + delay
-    if eligible <= deadline:
-        return deadline
-    ticks = math.ceil((eligible - deadline) / st.interval)
-    return deadline + ticks * st.interval
-
-
 def render_usage(st, width, now, monotonic_now=None):
     if monotonic_now is None:
         monotonic_now = time.monotonic()
     data = st.usage
-    status = section_status(st.usage_at, st.usage_fetching,
-                            usage_next_fetch(st, now, monotonic_now), now, monotonic_now)
+    status = section_status(st.usage_at, st.usage_fetching, st.global_next_fetch, now, monotonic_now)
     out = [line(("USAGE", H1), status)]
     if st.usage_err:
         out.append(line((f"⚠ {st.usage_err}", BAD)))
@@ -1252,8 +1236,16 @@ def decode_keys(data, pending=b"", flush=False):
                 continue
             if intro == 0x1B:
                 index += 1
-            else:
-                index += 2  # discard unsupported two-byte escapes, including Alt-key prefixes
+                continue
+            # discard any other escape whole: ESC, intermediates 0x20-0x2F, then one final byte
+            final = index + 1
+            while final < len(buf) and 0x20 <= buf[final] <= 0x2F:
+                final += 1
+            if final == len(buf):
+                if not flush:
+                    return keys, buf[index:]
+                break
+            index = final + 1
             continue
         if byte in (0x0A, 0x0D):
             keys.append("enter")
@@ -1341,7 +1333,6 @@ class State:
     global_next_fetch = None
     prs_fetching = False
     usage_fetching = False
-    usage_every = None
 
 
 class Dashboard:
@@ -1497,7 +1488,6 @@ def main():
     usage_every = args.usage_every if args.usage_every is not None else usage["refetch_after"]
     if args.cached or usage_every == 0:
         usage_every = None
-    st.usage_every = usage_every
     hidden = set(args.no_integration)
     unknown = hidden - {s["name"] for s in cfg["integrations"]}
     if unknown:
@@ -1585,8 +1575,9 @@ def watch(st, usage_every):
                                 refresh_thread.start()
                                 live.refresh()
                         timeout = max(0, deadline - time.monotonic())
-                        if refresh_thread.is_alive() and timeout == 0:
-                            timeout = 0.2
+                        if refresh_thread.is_alive() and (force or timeout == 0):
+                            # poll so a pending follow-up starts as soon as this refresh ends
+                            timeout = 0.2 if timeout == 0 else min(timeout, 0.2)
                         if pending_since is not None:
                             timeout = min(timeout, max(0, pending_since + KEY_ESCAPE_TIMEOUT -
                                                        time.monotonic()))
