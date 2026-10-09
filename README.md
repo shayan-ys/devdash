@@ -216,10 +216,17 @@ each within its own timeout, alongside the built-in GitHub and usage reads.
 send to omp, and its Watcher shows the latest Review. Its one-shot mode, `prompt-tutor --once`,
 prints one frame sized to `COLUMNS` and `LINES` and exits, so it works as an integration as is.
 
-1. Install prompt-tutor and put its Watcher on your `PATH`, as its
-   [install instructions](https://github.com/shayan-ys/prompt-tutor#install) describe
-   (`omp plugin install github:shayan-ys/prompt-tutor`, restart omp, then run
-   `/prompt-tutor install-watcher` inside omp).
+1. Install prompt-tutor and put its Watcher on your `PATH`. Until prompt-tutor's first build is
+   merged into its `main` branch, `main` holds only planning documents, so install the
+   `build/v0` branch:
+
+   ```sh
+   omp plugin install 'github:shayan-ys/prompt-tutor#build/v0'
+   ```
+
+   Restart omp, then run `/prompt-tutor install-watcher` inside omp. After the merge, follow
+   prompt-tutor's [install instructions](https://github.com/shayan-ys/prompt-tutor#install),
+   which install from `main`.
 2. Check that the frame fits a narrow pane:
 
    ```sh
