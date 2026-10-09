@@ -1406,10 +1406,13 @@ class State:
 
 
 class Dashboard:
-    """Rebuilt on every Live refresh, so resizes and countdowns stay current."""
+    """Rebuilt on every Live refresh, so resizes and countdowns stay current.
 
-    def __init__(self, st):
+    With `window`, a dashboard taller than the pane shows the rows at `st.scroll` beside a scrollbar."""
+
+    def __init__(self, st, window=True):
         self.st = st
+        self.window = window
 
     def __rich_console__(self, console, options):
         now = time.time()
@@ -1419,10 +1422,10 @@ class Dashboard:
         room = max(1, (options.height or console.height) - 2)
         width = options.max_width
         rows = self.rows(width, now, monotonic_now)
-        overflow = len(rows) > room
-        if overflow:  # lay out one column narrower to make room for the scrollbar
+        if self.window and len(rows) > room:  # lay out one column narrower to make room for the scrollbar
             width -= 1
             rows = self.rows(width, now, monotonic_now)
+        overflow = self.window and len(rows) > room  # data can change between the two layouts
         if width != st.width:  # integrations lay out for the new width now, not at their next run
             st.width = width
             for ig in st.integrations:
@@ -1433,13 +1436,13 @@ class Dashboard:
         scroll_keys = "/".join(k for k in (keys["scroll_up"], keys["scroll_down"]) if k)
         if overflow and scroll_keys:
             hints.append(f"{scroll_keys} scroll")
+        # The key loop changes st.scroll on another thread: read it once, clamp it, and use only that.
+        scroll = max(0, min(st.scroll, len(rows) - room)) if overflow else 0
+        st.scroll = scroll
         if overflow:
-            st.scroll = max(0, min(st.scroll, len(rows) - room))
             rows = [with_bar(row, width, bar)
-                    for row, bar in zip(rows[st.scroll:st.scroll + room],
-                                        scrollbar(room, len(rows), st.scroll), strict=True)]
-        else:
-            st.scroll = 0
+                    for row, bar in zip(rows[scroll:scroll + room],
+                                        scrollbar(room, len(rows), scroll), strict=True)]
         yield Group(*rows, Text(), line((" · ".join(hints), META)))
 
     def rows(self, width, now, monotonic_now):
@@ -1636,7 +1639,7 @@ def print_once(st, usage_every):
             job.result()
     finally:
         runner.shutdown(wait=False)  # on an early exit, main stops the commands these workers wait on
-    CONSOLE.print(Dashboard(st), height=10_000)
+    CONSOLE.print(Dashboard(st, window=False))
 
 
 def watch(st, usage_every):
@@ -1645,9 +1648,11 @@ def watch(st, usage_every):
     tty.setcbreak(fd)
     # Alternate scroll mode: the mouse wheel sends arrow keys on the full-screen view, which
     # has no scrollback, so the wheel scrolls the dashboard. Save the mode and restore it on exit.
-    CONSOLE.file.write("\x1b[?1007s\x1b[?1007h")
-    CONSOLE.file.flush()
+    scroll_mode = CONSOLE.is_terminal
     try:
+        if scroll_mode:
+            CONSOLE.file.write("\x1b[?1007s\x1b[?1007h")
+            CONSOLE.file.flush()
         with integration_state_files(st):
             focusable = focusable_integrations(st)
             st.focus = focusable[0] if focusable else None
@@ -1709,9 +1714,12 @@ def watch(st, usage_every):
                 for ig in st.integrations:
                     ig.stop()
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        CONSOLE.file.write("\x1b[?1007r")
-        CONSOLE.file.flush()
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        finally:
+            if scroll_mode:
+                CONSOLE.file.write("\x1b[?1007r")
+                CONSOLE.file.flush()
 
 
 if __name__ == "__main__":

@@ -830,6 +830,10 @@ def test_a_dashboard_taller_than_the_pane_scrolls_with_its_keys_within_bounds():
     for _ in range(100):
         devdash.dispatch_key(st, "up")
     assert frame() == top
+    once = Console(record=True, width=80, height=12)
+    once.print(devdash.Dashboard(st, window=False))  # --once prints every row, with no scrollbar
+    printed = [row.rstrip() for row in once.export_text().splitlines()]
+    assert "row 29" in printed and printed[-1] == "q quit"
 
 
 def test_refresh_hint_follows_my_prs_when_review_is_hidden_and_focus_needs_two():
