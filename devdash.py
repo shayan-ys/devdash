@@ -42,7 +42,8 @@ from urllib.request import Request, urlopen
 
 from rich.console import Console, Group
 from rich.live import Live
-from rich.text import Text
+from rich.style import Style
+from rich.text import Span, Text
 
 __version__ = "0.1.0"
 CONSOLE = Console()
@@ -858,9 +859,13 @@ def render_review(st, width, now):
 POSITIONS = ("top", "after-usage", "after-my-prs", "bottom")
 INTEGRATION = {"name": "", "title": "", "command": [], "position": "bottom", "enabled": True,
                "interval": 0, "timeout": 10, "max_rows": 20, "env": {}}
-NAME_RULE = re.compile(r"^[A-Za-z0-9_.-]+$")
+NAME_RULE = re.compile(r"[A-Za-z0-9_.-]+")
 MAX_OUTPUT = 64 * 1024  # bytes of standard output devdash keeps; a command that prints more is stopped
 ERR_TAIL = 4 * 1024     # bytes of standard error devdash keeps, the newest ones, for the error line
+MAX_SECONDS = DAY       # upper bound for interval and timeout; threading and select reject huge waits
+# C0 controls except tab and newline, DEL, and C1 controls: what is left of escape sequences
+# that Rich does not decode. Each one becomes U+FFFD so styled spans keep their offsets.
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def check_integrations(items):
@@ -871,7 +876,7 @@ def check_integrations(items):
             raise SystemExit(f"devdash: integrations[{i}] must be a table")
         spec = merge(INTEGRATION, raw, f"integrations[{i}].")
         name = spec["name"]
-        if not isinstance(name, str) or not NAME_RULE.match(name):
+        if not isinstance(name, str) or not NAME_RULE.fullmatch(name):
             raise SystemExit(f"devdash: integrations[{i}].name is required: letters, digits, '.', '_' or '-'")
         if name in names:
             raise SystemExit(f"devdash: integration name '{name}' is used twice")
@@ -884,10 +889,12 @@ def check_integrations(items):
             raise SystemExit(f"{where} title must be a string")
         if spec["position"] not in POSITIONS:
             raise SystemExit(f"{where} position must be one of {', '.join(POSITIONS)}")
-        if spec["interval"] < 0:
-            raise SystemExit(f"{where} interval must be 0 (the global interval) or more")
-        if spec["timeout"] < 1 or spec["max_rows"] < 1:
-            raise SystemExit(f"{where} timeout and max_rows must be 1 or more")
+        if not 0 <= spec["interval"] <= MAX_SECONDS:
+            raise SystemExit(f"{where} interval must be 0 (the global interval) to {MAX_SECONDS}")
+        if not 1 <= spec["timeout"] <= MAX_SECONDS:
+            raise SystemExit(f"{where} timeout must be 1 to {MAX_SECONDS}")
+        if spec["max_rows"] < 1:
+            raise SystemExit(f"{where} max_rows must be 1 or more")
         if not all(isinstance(v, str) for v in spec["env"].values()):
             raise SystemExit(f"{where} env values must be strings")
         specs.append(spec)
@@ -895,8 +902,15 @@ def check_integrations(items):
 
 
 def output_rows(text, max_rows):
-    """A command's ANSI output as screen rows, trailing blank rows dropped, at most `max_rows`."""
-    body = Text.from_ansi(text)
+    """A command's ANSI output as screen rows, trailing blank rows dropped, at most `max_rows`.
+
+    Only SGR styles and OSC 8 links survive: Rich decodes those, the leftover control
+    characters are replaced, and a link whose target holds a control character is dropped."""
+    body = Text.from_ansi(text.replace("\r\n", "\n"))
+    body.plain = CONTROL.sub("\ufffd", body.plain)
+    body.spans = [Span(s.start, s.end, s.style.update_link(None))
+                  if isinstance(s.style, Style) and s.style.link and CONTROL.search(s.style.link) else s
+                  for s in body.spans]
     body.expand_tabs()
     rows = [line(r) for r in body.split("\n")]
     while rows and not rows[-1].plain.strip():
@@ -905,6 +919,11 @@ def output_rows(text, max_rows):
         hidden = len(rows) - max_rows + 1
         rows = rows[:max_rows - 1] + [line((f"… {hidden} more rows", META))]
     return rows
+
+
+def plain_line(text):
+    """`text` as one row of plain characters, for messages built from a command's stderr."""
+    return CONTROL.sub("", Text.from_ansi(text).plain.replace("\n", " "))
 
 
 def kill_group(p):
@@ -952,18 +971,18 @@ def capture(p, deadline):
 
 
 class Integration:
-    """One configured section. Its own thread writes rows/at/err; the render thread only reads them."""
+    """One configured section. Its own thread publishes `result`; the render thread reads it."""
 
     def __init__(self, spec, interval):
         self.name = spec["name"]
         self.title = spec["title"] or spec["name"].upper()
         self.command = [os.path.expanduser(spec["command"][0]), *spec["command"][1:]]
         self.position = spec["position"]
-        self.interval = spec["interval"] or interval
+        self.interval = min(spec["interval"] or interval, MAX_SECONDS)  # the global interval is unbounded
         self.timeout = spec["timeout"]
         self.max_rows = spec["max_rows"]
         self.env = spec["env"]
-        self.rows, self.at, self.err = [], 0, None
+        self.result = ([], 0, None)  # (rows, fetched at, error)
         self.wake = threading.Event()
         # stop() and fetch() share the running command under this lock, so a command
         # started while devdash quits is either never started or killed.
@@ -989,6 +1008,10 @@ class Integration:
             out, err, full = capture(p, time.monotonic() + self.timeout)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"timed out after {self.timeout}s") from None
+        except BaseException:
+            if p.returncode is None:  # never leave a command running behind an unexpected error
+                kill_group(p)
+            raise
         finally:
             with self.lock:
                 self.proc = None
@@ -1000,11 +1023,14 @@ class Integration:
         return output_rows(out.decode(errors="replace"), self.max_rows)
 
     def poll(self, width):
-        """Run the command once. A failure keeps the last good rows on screen under the error."""
+        """Run the command once. A failure keeps the last good rows on screen under the error.
+
+        `result` is (rows, fetched at, error), replaced as one tuple so a frame never mixes two runs."""
         try:
-            self.rows, self.at, self.err = self.fetch(width), time.time(), None
+            self.result = (self.fetch(width), time.time(), None)
         except Exception as e:  # one broken integration must never stop the dashboard
-            self.err = str(e)[:80]
+            rows, at, _ = self.result
+            self.result = (rows, at, plain_line(str(e))[:80])
 
     def loop(self, st):
         while not self.stopped:
@@ -1026,14 +1052,15 @@ class Integration:
 
 
 def render_integration(ig, now):
-    if ig.at:
-        age = ("  fetched " + dur(now - ig.at) + " ago", META)
+    rows, at, err = ig.result
+    if at:
+        age = ("  fetched " + dur(now - at) + " ago", META)
     else:
-        age = ("  loading…", META) if not ig.err else ""
+        age = ("  loading…", META) if not err else ""
     out = [line((ig.title, H1), age)]
-    if ig.err:
-        out.append(line((f"⚠ {ig.err}", BAD)))
-    return out + ig.rows
+    if err:
+        out.append(line((f"⚠ {err}", BAD)))
+    return out + rows
 
 
 
@@ -1200,25 +1227,41 @@ def main():
     pool = ThreadPoolExecutor(2)
 
     st.width = CONSOLE.width
-    if args.once or not sys.stdin.isatty():
-        with ThreadPoolExecutor(max(1, len(st.integrations))) as runner:
-            for ig in st.integrations:
-                runner.submit(ig.poll, st.width)
-            refresh(st, pool, usage_every, False)
-        CONSOLE.print(Dashboard(st), height=10_000)
-        return
-
-    for ig in st.integrations:
-        threading.Thread(target=ig.loop, args=(st,), daemon=True, name=f"integration-{ig.name}").start()
     # Closing the pane sends SIGHUP; exit through `finally` so running integrations are killed.
     for sig in (signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, lambda *_: sys.exit(0))
+    try:
+        if args.once or not sys.stdin.isatty():
+            print_once(st, pool, usage_every)
+        else:
+            watch(st, pool, usage_every)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for ig in st.integrations:
+            ig.stop()
 
+
+def print_once(st, pool, usage_every):
+    runner = ThreadPoolExecutor(max(1, len(st.integrations)))
+    try:
+        jobs = [runner.submit(ig.poll, st.width) for ig in st.integrations]
+        refresh(st, pool, usage_every, False)
+        for job in jobs:
+            job.result()
+    finally:
+        runner.shutdown(wait=False)  # on an early exit, main stops the commands these workers wait on
+    CONSOLE.print(Dashboard(st), height=10_000)
+
+
+def watch(st, pool, usage_every):
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     tty.setcbreak(fd)
-    force = False
     try:
+        for ig in st.integrations:
+            threading.Thread(target=ig.loop, args=(st,), daemon=True, name=f"integration-{ig.name}").start()
+        force = False
         with Live(Dashboard(st), console=CONSOLE, screen=True, refresh_per_second=1):
             while True:
                 refresh(st, pool, usage_every, force)
@@ -1234,11 +1277,7 @@ def main():
                             for ig in st.integrations:
                                 ig.wake.set()
                             break
-    except KeyboardInterrupt:
-        pass
     finally:
-        for ig in st.integrations:
-            ig.stop()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 

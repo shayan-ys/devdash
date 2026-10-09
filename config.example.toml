@@ -45,8 +45,8 @@ order = []  # e.g. ["openai-codex", "anthropic"]
 # title = "WEATHER"           # heading; default: the name in capitals
 # command = ["curl", "-fsS", "https://wttr.in/?format=3"]
 # position = "bottom"         # "top" | "after-usage" | "after-my-prs" | "bottom"
-# interval = 0                # seconds between runs; 0 = the global interval
-# timeout = 10                # seconds before the command and its children are killed
+# interval = 0                # seconds between runs, up to 86400; 0 = the global interval
+# timeout = 10                # seconds (1 to 86400) before the command and its children are killed
 # max_rows = 20               # longer output is cut
 # enabled = true
 # env = {}                    # extra environment variables, e.g. { CITY = "Toronto" }

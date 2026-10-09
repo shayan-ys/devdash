@@ -175,8 +175,8 @@ name = "weather"                    # required; unique; used by --no-integration
 title = "WEATHER"                    # heading; defaults to the name in capitals
 command = ["curl", "-fsS", "https://wttr.in/Toronto?format=3"]
 position = "top"                     # top, after-usage, after-my-prs, or bottom (the default)
-interval = 900                       # seconds between runs; 0 (the default) uses the global interval
-timeout = 10                         # seconds before the command and its children are killed
+interval = 900                       # seconds between runs, up to 86400; 0 (the default) uses the global interval
+timeout = 10                         # seconds, 1 to 86400, before the command and its children are killed
 max_rows = 20                        # longer output is cut, ending in "… N more rows"
 enabled = true                       # false keeps the table but hides the section
 env = { WTTR_LANG = "en" }           # extra environment variables for the command
@@ -192,24 +192,28 @@ Integrations that share a position appear in the order they are listed in the fi
 **What a command must do.** Print the section body and exit with status 0. Any language works:
 a shell script, a Python file, or an existing CLI with a one-shot mode. devdash sets `COLUMNS`
 to the pane width and `LINES` to `max_rows`, so the command can fit its output to the room it has;
-when the pane is resized, devdash runs every integration again at once. Colors (SGR) and
-hyperlinks (OSC 8) are kept; cursor movement, screen clears, and every other escape sequence are
-dropped, and rows longer than the pane end in `…`. Trailing blank rows are removed. devdash keeps
+when the pane is resized, devdash runs every waiting integration again at once (one that is
+already running finishes first). Colors (SGR) and hyperlinks (OSC 8) are kept. Cursor movement,
+screen clears, and every other escape sequence are dropped, and any other control character
+shows as `�`. A link whose target contains a control character loses its link. Rows longer
+than the pane end in `…`. Trailing blank rows are removed. devdash keeps
 the first 64 KiB of standard output: a command that prints more is stopped there, and that part
 is shown. Of standard error it keeps only the last 4 KiB, so a noisy command cannot use up memory.
 
 **Failures.** A non-zero exit, a timeout, or a command that cannot start shows `⚠` and the
-reason (for a non-zero exit, the last line of its standard error) under the heading. The last
-good output stays on screen below the error, and the heading tells you how old it is.
+reason under the heading: for a non-zero exit, the last line of its standard error, as plain
+text. The last good output stays on screen below the error, and the heading tells you how old it is.
 
 **Safety.** An integration runs with your user's rights. Only list commands you trust.
 devdash runs the `command` list directly, without a shell; to use pipes or `&&`, write
 `["sh", "-c", "…"]` or point at a script. The first element may start with `~`. Each
 integration runs on its own thread, with no standard input and in its own process group, so a
-slow or hung command cannot freeze the dashboard or read your keystrokes, and a timeout kills
-the command together with every process it started. Pressing `r` runs every integration again
-immediately. With `--once`, devdash runs all of them in parallel and waits at most for the
-slowest timeout.
+slow or hung command cannot freeze the dashboard or read your keystrokes. A timeout kills the
+command together with every process it started that stayed in its process group; a program
+that starts its own session (a daemon, for example) escapes this. Quitting devdash, with `q`,
+Ctrl-C, or by closing the pane, kills running commands the same way. Pressing `r` runs every
+waiting integration again at once. With `--once`, devdash runs all integrations in parallel,
+each within its own timeout, alongside the built-in GitHub and usage reads.
 
 ## Troubleshooting
 

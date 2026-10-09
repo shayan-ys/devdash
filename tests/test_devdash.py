@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sys
@@ -49,10 +50,13 @@ def test_config_merges_over_defaults(tmp_path):
     "[usage]\nenabled = \"sometimes\"\n",
     "[[integrations]]\ncommand = [\"date\"]\n",                                    # no name
     "[[integrations]]\nname = \"a b\"\ncommand = [\"date\"]\n",                     # name unusable as a flag value
+    "[[integrations]]\nname = \"a\\n\"\ncommand = [\"date\"]\n",                    # trailing newline
     "[[integrations]]\nname = \"a\"\ncommand = []\n",
     "[[integrations]]\nname = \"a\"\ncommand = \"date\"\n",                        # a shell string, not argv
     "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nposition = \"middle\"\n",
     "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\ntimeout = 0\n",
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\ntimeout = 9223372036854775807\n",  # too big to wait on
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\ninterval = 9223372036854775807\n",
     "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nenv = { N = 1 }\n",
     "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nintervl = 5\n",
     "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\n[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\n",
@@ -493,6 +497,37 @@ def integration(code, **spec):
                                 "command": [sys.executable, "-c", code]}, 60)
 
 
+def gone(pid, wait=5):
+    """True once `pid` has exited within `wait` seconds; a zombie waiting to be reaped counts as exited."""
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        state = devdash.subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+        if not state.stdout.strip() or state.stdout.strip().startswith("Z"):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def spawner(pid_file, sleep=60):
+    """Python that starts a sleeping child, records the child's pid, then sleeps itself."""
+    return ("import subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep({sleep})'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+            f"time.sleep({sleep})")
+
+
+def wait_for_pid(pid_file):
+    for _ in range(200):
+        if pid_file.exists() and pid_file.read_text():
+            return int(pid_file.read_text())
+        time.sleep(0.05)
+    pytest.fail("the command never started its child")
+
+
 def test_integration_keeps_colour_and_links_drops_screen_control_and_gets_its_room():
     ig = integration(
         "import os; print('\\x1b[2J\\x1b[H\\x1b[1mbold\\x1b[0m '"
@@ -500,11 +535,32 @@ def test_integration_keeps_colour_and_links_drops_screen_control_and_gets_its_ro
         " + ' ' + os.environ['COLUMNS'] + 'x' + os.environ['LINES'] + ' ' + os.environ['GREETING'])",
         max_rows=7, env={"GREETING": "hi"})
     ig.poll(42)
-    assert ig.err is None and ig.at
-    [row] = ig.rows
+    [row], at, err = ig.result
+    assert err is None and at
     assert row.plain == "bold link 42x7 hi"
     assert {(row.plain[s.start:s.end], str(s.style)) for s in row.spans} >= {
         ("bold", "bold"), ("link", "link https://x.test")}
+
+
+def test_integration_output_cannot_smuggle_terminal_control():
+    hostile = ("\x1b[31mred\x1b[0m \x01\x1b\x9b2J \x1b]8;;https://x.test/\x9b2J\x1b\\bad link\x1b]8;;\x1b\\"
+               " \x1b]8;;\x07\x1b[2J\x1b\\gone\r\n")
+    out = io.StringIO()
+    console = Console(file=out, force_terminal=True, color_system="truecolor", width=80,
+                      _environ={"TERM": "xterm-256color"})
+    for row in devdash.output_rows(hostile, 5):
+        console.print(row)
+    emitted = out.getvalue()
+    assert "\x1b[31m" in emitted  # colour survives
+    for bad in ("\x01", "\x9b", "\x07", "\x1b[2J", "\x1b]8;;https://x.test/"):
+        assert bad not in emitted
+    assert "bad link" in emitted
+
+
+def test_integration_error_line_is_plain_text():
+    ig = integration("import sys; sys.stderr.write('\\x1b[2J\\x1b[31mbad\\x07\\n'); sys.exit(2)")
+    ig.poll(40)
+    assert ig.result[2] == "exit 2: bad"
 
 
 def test_integration_failure_keeps_the_last_good_rows_under_the_error():
@@ -512,27 +568,31 @@ def test_integration_failure_keeps_the_last_good_rows_under_the_error():
     ig.poll(40)
     ig.command = [sys.executable, "-c", "import sys; sys.exit('boom')"]
     ig.poll(40)
-    assert ig.err == "exit 1: boom"
-    assert [r.plain for r in devdash.render_integration(ig, ig.at)] == ["T  fetched 0s ago", "⚠ exit 1: boom", "first"]
+    _, at, err = ig.result
+    assert err == "exit 1: boom"
+    assert [r.plain for r in devdash.render_integration(ig, at)] == ["T  fetched 0s ago", "⚠ exit 1: boom", "first"]
 
 
 def test_integration_timeout_kills_the_whole_process_group(tmp_path):
     pid_file = tmp_path / "child.pid"
-    ig = integration("import subprocess, sys, time\n"
-                     f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
-                     f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
-                     "time.sleep(30)", timeout=1)
+    ig = integration(spawner(pid_file), timeout=3)
     ig.poll(40)
-    assert ig.err == "timed out after 1s"
-    pid = int(pid_file.read_text())
-    for _ in range(50):  # the kernel reaps the orphan shortly after SIGKILL
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.05)
-    else:
-        pytest.fail("the command's child outlived the timeout")
+    assert ig.result[2] == "timed out after 3s"
+    assert gone(wait_for_pid(pid_file)), "the command's child outlived the timeout"
+
+
+def test_integration_unexpected_capture_error_still_kills_the_command(tmp_path, monkeypatch):
+    pid_file = tmp_path / "child.pid"
+
+    def broken(p, deadline):
+        wait_for_pid(pid_file)
+        raise OSError("selector failed")
+
+    monkeypatch.setattr(devdash, "capture", broken)
+    ig = integration(spawner(pid_file), timeout=60)
+    ig.poll(40)
+    assert ig.result[2] == "selector failed"
+    assert gone(int(pid_file.read_text())), "the command's child outlived the error"
 
 
 def test_integration_output_is_cut_to_max_rows_with_a_count():
@@ -550,7 +610,8 @@ def test_integration_flooding_stdout_is_stopped_at_the_output_cap():
     assert p.returncode is not None and time.monotonic() - started < 10  # stopped, not left to time out
     ig = integration("import sys\nwhile True: sys.stdout.write('row\\n' * 4096)", timeout=30, max_rows=3)
     ig.poll(40)
-    assert ig.err is None and [r.plain for r in ig.rows][:2] == ["row", "row"]
+    rows, _, err = ig.result
+    assert err is None and [r.plain for r in rows][:2] == ["row", "row"]
 
 
 def test_integration_keeps_only_the_tail_of_a_flooded_stderr():
@@ -560,34 +621,21 @@ def test_integration_keeps_only_the_tail_of_a_flooded_stderr():
     _, err, _ = devdash.capture(p, time.monotonic() + 30)
     assert len(err) <= devdash.ERR_TAIL and err.endswith(b"the real reason\n")
     ig.poll(40)
-    assert ig.err == "exit 1: the real reason"
+    assert ig.result[2] == "exit 1: the real reason"
 
 
 def test_stopping_an_integration_kills_its_running_command_and_children(tmp_path):
     pid_file = tmp_path / "child.pid"
-    ig = integration("import subprocess, sys, time\n"
-                     "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
-                     f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
-                     "time.sleep(60)", timeout=60)
-    st = devdash.State()
-    thread = devdash.threading.Thread(target=ig.loop, args=(st,), daemon=True)
+    ig = integration(spawner(pid_file), timeout=60)
+    thread = devdash.threading.Thread(target=ig.loop, args=(devdash.State(),), daemon=True)
     thread.start()
-    for _ in range(100):
-        if pid_file.exists() and pid_file.read_text():
-            break
-        time.sleep(0.05)
-    child = int(pid_file.read_text())
-    ig.stop()
+    try:
+        child = wait_for_pid(pid_file)
+    finally:
+        ig.stop()
     thread.join(5)
     assert not thread.is_alive()  # the loop ends instead of waiting out the 60s timeout
-    for _ in range(50):
-        try:
-            os.kill(child, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.05)
-    else:
-        pytest.fail("the command's child outlived devdash")
+    assert gone(child), "the command's child outlived devdash"
 
 
 def test_integrations_render_in_their_slots_between_built_in_sections():
@@ -597,7 +645,7 @@ def test_integrations_render_in_their_slots_between_built_in_sections():
     st.usage, st.mine, st.review = {"reports": []}, [], []
     for name in ("bottom", "after-my-prs", "top", "after-usage", "bottom2"):
         ig = integration("", name=name, position=name.rstrip("2"))
-        ig.rows = [devdash.line(f"{name} body")]
+        ig.result = ([devdash.line(f"{name} body")], 0, None)
         st.integrations.append(ig)
     console = Console(record=True, width=50)
     console.print(devdash.Dashboard(st), height=10_000)
