@@ -249,9 +249,6 @@ prints one frame sized to `COLUMNS` and `LINES` and exits, so it works as an int
 4. Run `devdash`. The section updates on the global interval; press `r` to refresh it after a
    prompt, and use `devdash --no-integration prompt-tutor` to hide it for one run.
 
-The frame's last row lists the Watcher's own keys (`j/k`, `s`, `q`). They work only in the
-standalone `prompt-tutor` Watcher, not inside devdash.
-
 ## Troubleshooting
 
 **`gh is not signed in`.** Run `gh auth login`. With more than one account, pass `--github USER`
