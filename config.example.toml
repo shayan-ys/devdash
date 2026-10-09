@@ -59,3 +59,12 @@ order = []  # e.g. ["openai-codex", "anthropic"]
 # Integration bindings map keys to action names the command understands.
 # Example for a build with prompt-tutor key support:
 # keys = { j = "newer", k = "older", s = "scope", J = "scroll-down", K = "scroll-up" }
+# Prompt-tutor updates immediately when its data files change; omit interval to disable polling.
+# [[integrations]]
+# name = "prompt-tutor"
+# title = "PROMPT TUTOR"
+# command = ["prompt-tutor", "--once"]
+# position = "bottom"
+# max_rows = 16
+# watch = ["~/.local/share/prompt-tutor", "~/.config/prompt-tutor"]
+# keys = { j = "newer", k = "older", s = "scope", J = "scroll-down", K = "scroll-up" }

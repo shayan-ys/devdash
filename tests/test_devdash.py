@@ -42,6 +42,13 @@ def test_config_merges_over_defaults(tmp_path):
     assert cfg["interval"] == 60
 
 
+def test_integration_watch_defaults_off_and_expands_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCH_ROOT", str(tmp_path))
+    cfg = load(tmp_path, '[[integrations]]\nname = "t"\ncommand = ["date"]\nwatch = ["$WATCH_ROOT", "~/watch"]\n')
+    assert cfg["integrations"][0]["watch"] == [str(tmp_path), os.path.expanduser("~/watch")]
+    assert devdash.INTEGRATION["watch"] == []
+
+
 @pytest.mark.parametrize("text", [
     "intervl = 5\n",                          # typo in a top-level key
     "[github]\nexclude = \"acme\"\n",         # string where a list belongs
@@ -60,6 +67,8 @@ def test_config_merges_over_defaults(tmp_path):
     "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nenv = { N = 1 }\n",
     "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nintervl = 5\n",
     "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\n[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\n",
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nwatch = \"path\"\n",       # one path, not a list
+    "[[integrations]]\nname = \"a\"\ncommand = [\"date\"]\nwatch = [1]\n",
 ])
 def test_config_rejects_mistakes(tmp_path, text):
     with pytest.raises(SystemExit):
@@ -628,6 +637,88 @@ def test_watch_state_files_are_empty_private_and_removed(tmp_path):
         assert open(path, "rb").read() == b""
     assert st.integrations[0].state_file is None
     assert not os.path.exists(path)
+
+
+def test_watch_signature_sees_nested_changes_deletes_and_late_roots(tmp_path):
+    watched = tmp_path / "watched"
+    ig = integration("pass", watch=[str(watched)])
+    missing = ig.watch_signature()
+    (watched / "nested").mkdir(parents=True)
+    item = watched / "nested" / "item"
+    item.write_text("one")
+    created = ig.watch_signature()
+    assert created != missing
+    assert ig.watch_signature() == created
+    item.write_text("a longer value")
+    modified = ig.watch_signature()
+    assert modified != created
+    item.unlink()
+    assert ig.watch_signature() != modified
+
+
+def test_watch_signature_follows_a_symlinked_root(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (tmp_path / "linked").symlink_to(target, target_is_directory=True)
+    ig = integration("pass", watch=[str(tmp_path / "linked")])
+    before = ig.watch_signature()
+    (target / "item").write_text("new")
+    assert ig.watch_signature() != before
+
+
+@pytest.mark.parametrize("interval", [0, 60])
+def test_watched_integration_runs_on_change_and_only_polls_with_its_own_interval(tmp_path, interval):
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    log = tmp_path / "runs"
+    ig = integration("import os; open(os.environ['LOG'], 'a').write('run\\n')",
+                     watch=[str(watched)], interval=interval, env={"LOG": str(log)})
+    assert ig.interval == interval  # no interval of its own: watching replaces the global interval
+    st = devdash.State()
+    st.width = 40
+    thread = devdash.threading.Thread(target=ig.loop, args=(st,), daemon=True)
+    thread.start()
+
+    def wait_for_runs(count):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if log.exists() and len(log.read_text().splitlines()) >= count:
+                return
+            time.sleep(0.01)
+        pytest.fail(f"only {len(log.read_text().splitlines()) if log.exists() else 0} runs completed")
+
+    try:
+        wait_for_runs(1)
+        (watched / "new-file").write_text("new")
+        wait_for_runs(2)
+        time.sleep(0.3)
+        assert log.read_text().splitlines() == ["run", "run"]
+        status = devdash.render_integration(ig, time.time(), monotonic_now=time.monotonic())[0].plain
+        assert ("watching" in status) == (interval == 0)
+        assert ("next fetch" in status) == (interval > 0)
+    finally:
+        ig.stop()
+        thread.join(1)
+    assert not thread.is_alive()
+
+
+def test_watch_refreshes_during_writes_that_never_go_quiet(tmp_path):
+    log = tmp_path / "busy.log"
+    ig = integration("pass", watch=[str(tmp_path)])
+    refreshed = []
+    ig.request_refresh = lambda after_current=False: refreshed.append(time.monotonic())
+    thread = devdash.threading.Thread(target=ig.watch_loop, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 4  # appends every 0.05 s, faster than one 0.25 s scan
+        while time.monotonic() < deadline and not refreshed:
+            with open(log, "a") as f:
+                f.write("x")
+            time.sleep(0.05)
+        assert refreshed, "no refresh while writes kept coming"
+    finally:
+        ig.stop()
+        thread.join(1)
 
 
 def test_integration_action_queue_drops_presses_after_eight():

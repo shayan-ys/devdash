@@ -521,13 +521,15 @@ def usage_rows(report):
     return rows
 
 
-def section_status(fetched_at, fetching, next_fetch_at, now, monotonic_now):
+def section_status(fetched_at, fetching, next_fetch_at, now, monotonic_now, watching=False):
     if fetching:
         return ("  fetching…", META)
     parts = []
     if fetched_at:
         parts.append(f"fetched {dur(now - fetched_at)} ago")
-    if next_fetch_at is not None:
+    if watching:
+        parts.append("watching")
+    elif next_fetch_at is not None:
         seconds = max(0, math.ceil(next_fetch_at - monotonic_now))
         parts.append(f"next fetch {dur(seconds)}")
     return ("  " + " · ".join(parts), META) if parts else ""
@@ -911,7 +913,7 @@ def render_review(st, width, now, monotonic_now=None):
 # every other escape sequence is dropped.
 POSITIONS = ("top", "after-usage", "after-my-prs", "bottom")
 INTEGRATION = {"name": "", "title": "", "command": [], "position": "bottom", "enabled": True,
-               "interval": 0, "timeout": 10, "max_rows": 20, "env": {}, "keys": {}}
+               "interval": 0, "timeout": 10, "max_rows": 20, "env": {}, "keys": {}, "watch": []}
 NAME_RULE = re.compile(r"[A-Za-z0-9_.-]+")
 MAX_OUTPUT = 64 * 1024  # bytes of standard output devdash keeps; a command that prints more is stopped
 ERR_TAIL = 4 * 1024     # bytes of standard error devdash keeps, the newest ones, for the error line
@@ -946,6 +948,9 @@ def check_integrations(items, builtins=None):
             raise SystemExit(f"{where} position must be one of {', '.join(POSITIONS)}")
         if not 0 <= spec["interval"] <= MAX_SECONDS:
             raise SystemExit(f"{where} interval must be 0 (the global interval) to {MAX_SECONDS}")
+        if not isinstance(spec["watch"], list) or not all(isinstance(path, str) for path in spec["watch"]):
+            raise SystemExit(f"{where} watch must be a list of paths (strings)")
+        spec["watch"] = [os.path.expandvars(os.path.expanduser(path)) for path in spec["watch"]]
         if not 1 <= spec["timeout"] <= MAX_SECONDS:
             raise SystemExit(f"{where} timeout must be 1 to {MAX_SECONDS}")
         if spec["max_rows"] < 1:
@@ -1042,7 +1047,13 @@ class Integration:
         self.title = spec["title"] or spec["name"].upper()
         self.command = [os.path.expanduser(spec["command"][0]), *spec["command"][1:]]
         self.position = spec["position"]
-        self.interval = min(spec["interval"] or interval, MAX_SECONDS)  # the global interval is unbounded
+        self.watch_paths = tuple(spec["watch"])
+        self.watching = bool(self.watch_paths)
+        # Watching replaces interval polling unless the integration sets its own interval.
+        if spec["interval"] or not self.watching:
+            self.interval = min(spec["interval"] or interval, MAX_SECONDS)  # the global interval is unbounded
+        else:
+            self.interval = 0
         self.timeout = spec["timeout"]
         self.max_rows = spec["max_rows"]
         self.env = spec["env"]
@@ -1060,6 +1071,58 @@ class Integration:
         self.stopped = False
         self.actions = deque()
         self.refresh_requested = True
+
+    def watch_signature(self):
+        """Stat every path under the watch roots. Roots are followed; symlinks inside them are not."""
+        signature = []
+        for root in self.watch_paths:
+            try:
+                info = os.stat(root)
+            except OSError:
+                continue  # a missing root is watched for its creation
+            signature.append((root, info.st_mtime_ns, info.st_size))
+            if not os.path.isdir(root):
+                continue
+            pending = [root]
+            while pending:
+                directory = pending.pop()
+                try:
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            try:
+                                item = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            signature.append((entry.path, item.st_mtime_ns, item.st_size))
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(entry.path)
+                except OSError:
+                    continue
+        return tuple(sorted(signature))
+
+    def watch_loop(self):
+        """Run again after watched paths change: once writes go quiet for 0.2 s, or 2 s into a
+        continuous burst. Passes wait at least four times their own cost, so a big tree cannot hog a core."""
+        started = time.monotonic()
+        previous = self.watch_signature()
+        cost = time.monotonic() - started
+        changed_at = first_change = None
+        while True:
+            time.sleep(max(0.25, 4 * cost))
+            with self.lock:
+                if self.stopped:
+                    return
+            started = time.monotonic()
+            current = self.watch_signature()
+            now = time.monotonic()
+            cost = now - started
+            if current != previous:
+                previous = current
+                changed_at = now
+                first_change = first_change or now
+            if changed_at is not None and (now - changed_at >= 0.2 or now - first_change >= 2.0):
+                self.request_refresh(after_current=True)
+                changed_at = first_change = None
 
     def fetch(self, width, action=None):
         # COLUMNS and LINES tell the command how much room its section has.
@@ -1124,6 +1187,8 @@ class Integration:
             self.wake.set()
 
     def loop(self, st):
+        if self.watching:
+            threading.Thread(target=self.watch_loop, daemon=True, name=f"integration-watch-{self.name}").start()
         next_run = time.monotonic()
         while True:
             self.wake.clear()
@@ -1134,7 +1199,7 @@ class Integration:
                 action = self.actions.popleft() if self.actions else None
                 refresh_requested = self.refresh_requested
                 self.refresh_requested = False
-                run_now = action is not None or refresh_requested or now >= next_run
+                run_now = action is not None or refresh_requested or (self.interval > 0 and now >= next_run)
                 if run_now:
                     self.running = True
             if run_now:
@@ -1144,11 +1209,11 @@ class Integration:
                     next_run = time.monotonic() + self.interval
                     with self.lock:
                         self.running = False
-                        self.next_run_at = next_run
+                        self.next_run_at = next_run if self.interval > 0 else None
                     if st.live is not None:
                         st.live.refresh()
                 continue
-            self.wake.wait(max(0, next_run - time.monotonic()))
+            self.wake.wait(max(0, next_run - time.monotonic()) if self.interval > 0 else None)
 
     def stop(self):
         """Stop polling and kill a running command with everything it started.
@@ -1296,7 +1361,7 @@ def render_integration(ig, now, focused=False, monotonic_now=None):
     if monotonic_now is None:
         monotonic_now = time.monotonic()
     rows, at, err = ig.result
-    status = section_status(at, ig.running, ig.next_run_at, now, monotonic_now)
+    status = section_status(at, ig.running, ig.next_run_at, now, monotonic_now, ig.watching and ig.interval == 0)
     out = [line(("▸ " if focused else "", H1), (ig.title, H1), status)]
     if err:
         out.append(line((f"⚠ {err}", BAD)))
