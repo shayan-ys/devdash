@@ -13,6 +13,8 @@ All notable changes to this project are documented here. The format follows
   its own thread and schedule, with a timeout that kills its whole process group, and a
   failure keeps its last good output on screen under the error. `--no-integration NAME`
   hides one integration and `--no-integrations` hides all of them.
+- Integrations can watch files and directories for changes; watched integrations refresh on changes
+  both with and without a scheduled interval.
 - Configurable, case-sensitive built-in keys and per-integration actions, with private state files in watch mode,
   per-section key hints, and fetch countdowns on section headings.
 - `--profile NAME` selects the matching isolated omp profile for usage and cached readings;

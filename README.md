@@ -187,6 +187,18 @@ enabled = true                       # false keeps the table but hides the secti
 env = { WTTR_LANG = "en" }           # extra environment variables for the command
 ```
 
+`watch` is an optional list of file or directory paths. Paths expand `~` and environment variables;
+directories are watched recursively, and missing paths are watched for creation. Keep watch roots
+small data directories: devdash takes a full stat snapshot on each polling pass. A watched
+integration runs at startup and after watched files change, with a short debounce. With `watch`
+set and no positive `interval`, it does not poll on the global interval; actions, `r`, and file
+changes still run it. Set a positive `interval` to keep scheduled runs alongside watching. An
+empty list disables watching.
+
+```toml
+watch = ["~/.local/share/prompt-tutor", "~/.config/prompt-tutor"]
+```
+
 Integrations that share a position appear in the order they are listed in the file.
 
 ### Keys, actions, focus, and state
@@ -208,8 +220,9 @@ focusable. The focused section's heading starts with `▸ `.
 
 Section headings show how long ago the last result was fetched and count down to the next fetch,
 updating every second. Integrations use their own intervals; MY PRS, REVIEW REQUESTED, and USAGE
-use the global interval. While a section is fetching, its heading says
-`fetching…`. `--once` shows no countdown.
+use the global interval. A watched integration without an interval shows `watching` instead of a
+countdown. While a section is fetching, its heading says `fetching…`. `--once` shows no countdown
+and does not watch files.
 
 Global PR and usage refreshes run in the background, so input remains responsive. Pressing `r`
 while one is running schedules one follow-up refresh; key presses after `r` in the same input batch
@@ -287,12 +300,13 @@ The key actions and state-file behavior below require a prompt-tutor build with 
    command = ["prompt-tutor", "--once"]
    position = "bottom"
    max_rows = 16
+   watch = ["~/.local/share/prompt-tutor", "~/.config/prompt-tutor"]
    keys = { j = "newer", k = "older", s = "scope", J = "scroll-down", K = "scroll-up" }
    ```
 
    If devdash shows `⚠ cannot run prompt-tutor`, the Watcher link is not on the `PATH` that
    devdash sees; use its full path, for example `command = ["~/.local/bin/prompt-tutor", "--once"]`.
-4. Run `devdash`. The section updates on the global interval; press `j`/`k` for newer/older Prompts,
+4. Run `devdash`. The section updates when prompt-tutor data changes; press `j`/`k` for newer/older Prompts,
    `s` to change Scope, and `J`/`K` to scroll the Watcher frame. The integration keeps its view and
    selection in the state file. Press `r` to refresh the dashboard, and use `devdash --no-integration prompt-tutor` to hide it.
 
