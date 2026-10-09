@@ -13,6 +13,8 @@ All notable changes to this project are documented here. The format follows
   its own thread and schedule, with a timeout that kills its whole process group, and a
   failure keeps its last good output on screen under the error. `--no-integration NAME`
   hides one integration and `--no-integrations` hides all of them.
+- Configurable, case-sensitive built-in keys and per-integration actions, with private state files in watch mode,
+  per-section key hints, and fetch countdowns on section headings.
 - `--profile NAME` selects the matching isolated omp profile for usage and cached readings;
   only that profile's authenticated providers appear. Provider headings include that
   provider's account email in white, for example `Codex (user@example.com)`.
@@ -24,6 +26,14 @@ All notable changes to this project are documented here. The format follows
   `nous-portal` or `nous` credential.
 - Pace icons on weekly and monthly usage bars: `>` to `>>>` when you use a quota faster than
   time passes, `<` to `<<<` when slower, `|` on pace. Turn them off with `usage.pace = false`.
+
+### Changed
+
+- Built-in keys are case-sensitive; uppercase `R` and `Q` no longer trigger refresh or quit.
+- Global PR and usage refreshes run in the background; input stays responsive while they fetch.
+  Pressing refresh during an active refresh schedules one follow-up.
+- Section headings continue to show `fetching…` during a fetch. Each section lists its own keys;
+  the bottom row lists only quit and focus.
 
 ### Fixed
 

@@ -15,7 +15,7 @@ Sources (both are the tools' own JSON):
                                   devdash shows (see the README)
 
 Settings come from a TOML file (see --config); command-line flags win.
-Keys while watching: r = refresh now, q = quit.
+Keys while watching: configurable built-ins (r = refresh, q = quit, tab = focus) and focused integration bindings.
 """
 
 import argparse
@@ -23,7 +23,9 @@ import calendar
 import contextlib
 import hashlib
 import json
+import math
 import os
+import queue
 import re
 import select
 import selectors
@@ -35,7 +37,9 @@ import termios
 import threading
 import time
 import tomllib
+import tempfile
 import tty
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from urllib.request import Request, urlopen
@@ -119,9 +123,37 @@ DEFAULTS = {
     "interval": 60,
     "github": {"exclude": [], "review_requested": True, "account": ""},
     "usage": {"enabled": "auto", "refetch_after": 180, "pace": True, "order": [], "names": {}, "colors": {}},
+    "keys": {"refresh": "r", "quit": "q", "focus": "tab"},
     "integrations": [],
 }
 REPO_RULE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?$")
+SPECIAL_KEYS = {"up", "down", "left", "right", "enter", "tab"}
+
+
+def valid_key_name(key):
+    return (isinstance(key, str) and
+            (key in SPECIAL_KEYS or (len(key) == 1 and "!" <= key <= "~")))
+
+
+def check_builtin_keys(keys):
+    enabled = {}
+    for name in ("refresh", "quit", "focus"):
+        key = keys[name]
+        if not isinstance(key, str):
+            raise SystemExit(f"devdash: config key 'keys.{name}' must be a key name or an empty string")
+        if key and not valid_key_name(key):
+            raise SystemExit(f"devdash: config key 'keys.{name}' must be a printable key name or an empty string")
+        if key:
+            if key in enabled:
+                raise SystemExit(f"devdash: built-in keys '{enabled[key]}' and '{name}' both use '{key}'")
+            enabled[key] = name
+    return enabled
+
+
+def check_key_name(key, where):
+    if not valid_key_name(key):
+        raise SystemExit(f"devdash: {where} key {key!r} must be one printable ASCII character or "
+                         "'up', 'down', 'left', 'right', 'enter', or 'tab'")
 
 
 def merge(base, over, where=""):
@@ -160,7 +192,8 @@ def load_config(path, explicit):
     cfg = merge(DEFAULTS, raw)
     if cfg["usage"]["enabled"] not in (True, False, "auto"):
         raise SystemExit("devdash: config key 'usage.enabled' must be true, false, or \"auto\"")
-    cfg["integrations"] = check_integrations(cfg["integrations"])
+    builtins = check_builtin_keys(cfg["keys"])
+    cfg["integrations"] = check_integrations(cfg["integrations"], builtins)
     return cfg
 
 
@@ -488,9 +521,24 @@ def usage_rows(report):
     return rows
 
 
-def render_usage(st, width, now):
+def section_status(fetched_at, fetching, next_fetch_at, now, monotonic_now):
+    if fetching:
+        return ("  fetching…", META)
+    parts = []
+    if fetched_at:
+        parts.append(f"fetched {dur(now - fetched_at)} ago")
+    if next_fetch_at is not None:
+        seconds = max(0, math.ceil(next_fetch_at - monotonic_now))
+        parts.append(f"next fetch {dur(seconds)}")
+    return ("  " + " · ".join(parts), META) if parts else ""
+
+
+def render_usage(st, width, now, monotonic_now=None):
+    if monotonic_now is None:
+        monotonic_now = time.monotonic()
     data = st.usage
-    out = [line(("USAGE", H1), ("  fetched " + dur(now - st.usage_at) + " ago", META) if st.usage_at else "")]
+    status = section_status(st.usage_at, st.usage_fetching, st.global_next_fetch, now, monotonic_now)
+    out = [line(("USAGE", H1), status)]
     if st.usage_err:
         out.append(line((f"⚠ {st.usage_err}", BAD)))
     if not data:
@@ -806,9 +854,11 @@ def rule(width):
     return line(("─" * width, RULE))
 
 
-def render_mine(st, width, now):
-    out = [line(("MY PRS ", H1), (str(len(st.mine)), H1),
-                ("  fetched " + dur(now - st.prs_at) + " ago", META) if st.prs_at else "")]
+def render_mine(st, width, now, monotonic_now=None):
+    if monotonic_now is None:
+        monotonic_now = time.monotonic()
+    status = section_status(st.prs_at, st.prs_fetching, st.global_next_fetch, now, monotonic_now)
+    out = [line(("MY PRS ", H1), (str(len(st.mine)), H1), status)]
     if st.prs_err:
         out.append(line((f"⚠ {st.prs_err}", BAD)))
     for repo, groups in group_mine(st.mine).items():
@@ -834,8 +884,11 @@ def render_mine(st, width, now):
     return out
 
 
-def render_review(st, width, now):
-    out = [line(("REVIEW REQUESTED ", H1), (str(len(st.review)), H1)), Text()]
+def render_review(st, width, now, monotonic_now=None):
+    if monotonic_now is None:
+        monotonic_now = time.monotonic()
+    status = section_status(st.prs_at, st.prs_fetching, st.global_next_fetch, now, monotonic_now)
+    out = [line(("REVIEW REQUESTED ", H1), (str(len(st.review)), H1), status), Text()]
     if not st.review:
         out.append(line(("nothing waiting on you", META)))
     for ri, pr in enumerate(sorted(st.review, key=lambda p: p["updatedAt"], reverse=True)):
@@ -858,7 +911,7 @@ def render_review(st, width, now):
 # every other escape sequence is dropped.
 POSITIONS = ("top", "after-usage", "after-my-prs", "bottom")
 INTEGRATION = {"name": "", "title": "", "command": [], "position": "bottom", "enabled": True,
-               "interval": 0, "timeout": 10, "max_rows": 20, "env": {}}
+               "interval": 0, "timeout": 10, "max_rows": 20, "env": {}, "keys": {}}
 NAME_RULE = re.compile(r"[A-Za-z0-9_.-]+")
 MAX_OUTPUT = 64 * 1024  # bytes of standard output devdash keeps; a command that prints more is stopped
 ERR_TAIL = 4 * 1024     # bytes of standard error devdash keeps, the newest ones, for the error line
@@ -868,8 +921,10 @@ MAX_SECONDS = DAY       # upper bound for interval and timeout; threading and se
 CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
-def check_integrations(items):
-    """Validate the [[integrations]] tables, disabled ones included, and fill in their defaults."""
+def check_integrations(items, builtins=None):
+    """Validate every integration, including disabled ones, and fill in its defaults."""
+    if builtins is None:
+        builtins = check_builtin_keys(DEFAULTS["keys"])
     specs, names = [], set()
     for i, raw in enumerate(items):
         if not isinstance(raw, dict):
@@ -897,6 +952,15 @@ def check_integrations(items):
             raise SystemExit(f"{where} max_rows must be 1 or more")
         if not all(isinstance(v, str) for v in spec["env"].values()):
             raise SystemExit(f"{where} env values must be strings")
+        for key, action in spec["keys"].items():
+            check_key_name(key, where)
+            if not isinstance(action, str) or not NAME_RULE.fullmatch(action):
+                raise SystemExit(f"{where} action for key {key!r} must use letters, digits, '.', '_' or '-'")
+            if key in builtins:
+                builtin = builtins[key]
+                raise SystemExit(f"{where} key '{key}' conflicts with built-in '{builtin}'; "
+                                 f"remap it in [keys] (for example, keys.{builtin} = \"x\")")
+        spec["has_keys"] = "keys" in raw
         specs.append(spec)
     return specs
 
@@ -982,17 +1046,30 @@ class Integration:
         self.timeout = spec["timeout"]
         self.max_rows = spec["max_rows"]
         self.env = spec["env"]
+        self.keys = spec["keys"]
+        self.has_keys = spec.get("has_keys", bool(self.keys))
+        self.state_file = None
         self.result = ([], 0, None)  # (rows, fetched at, error)
+        self.next_run_at = None
         self.wake = threading.Event()
-        # stop() and fetch() share the running command under this lock, so a command
-        # started while devdash quits is either never started or killed.
+        # stop(), fetch(), and the action queue share this lock, so a command started
+        # while devdash quits is either never started or killed.
         self.lock = threading.Lock()
         self.proc = None
+        self.running = False
         self.stopped = False
+        self.actions = deque()
+        self.refresh_requested = True
 
-    def fetch(self, width):
+    def fetch(self, width, action=None):
         # COLUMNS and LINES tell the command how much room its section has.
         env = {**os.environ, **self.env, "COLUMNS": str(width), "LINES": str(self.max_rows)}
+        env.pop("DEVDASH_ACTION", None)
+        env.pop("DEVDASH_STATE_FILE", None)
+        if action is not None:
+            env["DEVDASH_ACTION"] = action
+        if self.state_file is not None:
+            env["DEVDASH_STATE_FILE"] = self.state_file
         with self.lock:
             if self.stopped:
                 raise RuntimeError("stopped")
@@ -1022,21 +1099,56 @@ class Integration:
             raise RuntimeError(f"exit {p.returncode}" + (f": {tail[-1]}" if tail else ""))
         return output_rows(out.decode(errors="replace"), self.max_rows)
 
-    def poll(self, width):
+    def poll(self, width, action=None):
         """Run the command once. A failure keeps the last good rows on screen under the error.
 
         `result` is (rows, fetched at, error), replaced as one tuple so a frame never mixes two runs."""
         try:
-            self.result = (self.fetch(width), time.time(), None)
+            self.result = (self.fetch(width, action), time.time(), None)
         except Exception as e:  # one broken integration must never stop the dashboard
             rows, at, _ = self.result
             self.result = (rows, at, plain_line(str(e))[:80])
 
+    def queue_action(self, action):
+        with self.lock:
+            if self.stopped or len(self.actions) >= 8:
+                return False
+            self.actions.append(action)
+            self.wake.set()
+            return True
+
+    def request_refresh(self, after_current=False):
+        with self.lock:
+            if not self.stopped and (not self.running or after_current):
+                self.refresh_requested = True
+            self.wake.set()
+
     def loop(self, st):
-        while not self.stopped:
+        next_run = time.monotonic()
+        while True:
             self.wake.clear()
-            self.poll(st.width)
-            self.wake.wait(self.interval)
+            now = time.monotonic()
+            with self.lock:
+                if self.stopped:
+                    return
+                action = self.actions.popleft() if self.actions else None
+                refresh_requested = self.refresh_requested
+                self.refresh_requested = False
+                run_now = action is not None or refresh_requested or now >= next_run
+                if run_now:
+                    self.running = True
+            if run_now:
+                try:
+                    self.poll(st.width, action)
+                finally:
+                    next_run = time.monotonic() + self.interval
+                    with self.lock:
+                        self.running = False
+                        self.next_run_at = next_run
+                    if st.live is not None:
+                        st.live.refresh()
+                continue
+            self.wake.wait(max(0, next_run - time.monotonic()))
 
     def stop(self):
         """Stop polling and kill a running command with everything it started.
@@ -1051,16 +1163,147 @@ class Integration:
                 os.killpg(p.pid, signal.SIGKILL)
 
 
-def render_integration(ig, now):
+@contextlib.contextmanager
+def integration_state_files(st):
+    """Give watch-mode integrations with a keys table one private, empty state file."""
+    keyed = [ig for ig in st.integrations if ig.has_keys]
+    if not keyed:
+        yield
+        return
+    with tempfile.TemporaryDirectory(prefix="devdash-") as directory:
+        os.chmod(directory, 0o700)
+        try:
+            for index, ig in enumerate(keyed):
+                path = os.path.join(directory, f"{index}.state")
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.fchmod(fd, 0o600)
+                os.close(fd)
+                ig.state_file = path
+            yield
+        finally:
+            for ig in keyed:
+                ig.state_file = None
+
+
+KEY_ESCAPE_TIMEOUT = 0.05
+
+
+def decode_keys(data, pending=b"", flush=False):
+    """Decode bindable key names while preserving an incomplete trailing escape sequence."""
+    buf = pending + data
+    keys, index = [], 0
+    while index < len(buf):
+        byte = buf[index]
+        if byte == 0x1B:
+            if index + 1 == len(buf):
+                if not flush:
+                    return keys, buf[index:]
+                index += 1
+                continue
+            intro = buf[index + 1]
+            if intro in (ord("["), ord("O")):
+                final = index + 2
+                while final < len(buf) and not 0x40 <= buf[final] <= 0x7E:
+                    final += 1
+                if final == len(buf):
+                    if not flush:
+                        return keys, buf[index:]
+                    break
+                if final == index + 2 and buf[final] in (ord("A"), ord("B"), ord("C"), ord("D")):
+                    keys.append({"A": "up", "B": "down", "C": "right", "D": "left"}[chr(buf[final])])
+                index = final + 1
+                continue
+            if intro in (ord("]"), ord("P"), ord("X"), ord("^"), ord("_")):
+                end, terminated = index + 2, False
+                while end < len(buf):
+                    if intro == ord("]") and buf[end] == 0x07:
+                        end += 1
+                        terminated = True
+                        break
+                    if buf[end] == 0x1B:
+                        if end + 1 == len(buf):
+                            break
+                        if buf[end + 1] == ord("\\"):
+                            end += 2
+                            terminated = True
+                            break
+                    end += 1
+                if not terminated:
+                    if not flush:
+                        return keys, buf[index:]
+                    break
+                index = end
+                continue
+            if intro == 0x1B:
+                index += 1
+                continue
+            # discard any other escape whole: ESC, intermediates 0x20-0x2F, then one final byte
+            final = index + 1
+            while final < len(buf) and 0x20 <= buf[final] <= 0x2F:
+                final += 1
+            if final == len(buf):
+                if not flush:
+                    return keys, buf[index:]
+                break
+            index = final + 1
+            continue
+        if byte in (0x0A, 0x0D):
+            keys.append("enter")
+        elif byte == 0x09:
+            keys.append("tab")
+        elif 0x21 <= byte <= 0x7E:
+            keys.append(chr(byte))
+        index += 1
+    return keys, b""
+
+
+def screen_integrations(st):
+    return [ig for position in POSITIONS for ig in st.integrations if ig.position == position]
+
+
+def focusable_integrations(st):
+    return [ig for ig in screen_integrations(st) if ig.keys]
+
+
+def focus_next(st):
+    integrations = focusable_integrations(st)
+    if len(integrations) < 2:
+        return False
+    current = next((i for i, ig in enumerate(integrations) if ig is st.focus), -1)
+    st.focus = integrations[(current + 1) % len(integrations)]
+    return True
+
+
+def dispatch_key(st, key):
+    """Apply one key press; built-ins take precedence over the focused integration."""
+    result = "ignored"
+    if key == st.keys["quit"] and st.keys["quit"]:
+        result = "quit"
+    elif key == st.keys["refresh"] and st.keys["refresh"]:
+        for ig in st.integrations:
+            ig.request_refresh()
+        result = "refresh"
+    elif key == st.keys["focus"] and st.keys["focus"]:
+        focus_next(st)
+    elif st.focus is not None and key in st.focus.keys:
+        st.focus.queue_action(st.focus.keys[key])
+    if st.live is not None:
+        st.live.refresh()
+    return result
+
+
+def render_integration(ig, now, focused=False, monotonic_now=None):
+    if monotonic_now is None:
+        monotonic_now = time.monotonic()
     rows, at, err = ig.result
-    if at:
-        age = ("  fetched " + dur(now - at) + " ago", META)
-    else:
-        age = ("  loading…", META) if not err else ""
-    out = [line((ig.title, H1), age)]
+    status = section_status(at, ig.running, ig.next_run_at, now, monotonic_now)
+    out = [line(("▸ " if focused else "", H1), (ig.title, H1), status)]
     if err:
         out.append(line((f"⚠ {err}", BAD)))
-    return out + rows
+    out += rows
+    if ig.keys:
+        out.append(line((" · ".join(f"{key} {action}" for key, action in ig.keys.items()), META)))
+    return out
 
 
 
@@ -1077,8 +1320,6 @@ class State:
     mine, review = [], []
     prs_at = 0
     prs_err = None
-    me = ""
-    busy = False
     interval = 60
     show_usage = True
     show_review = True
@@ -1086,6 +1327,12 @@ class State:
     excluded = []
     integrations = []
     width = 80  # the pane width at the last render, passed to integrations as COLUMNS
+    keys = DEFAULTS["keys"]
+    focus = None
+    live = None
+    global_next_fetch = None
+    prs_fetching = False
+    usage_fetching = False
 
 
 class Dashboard:
@@ -1096,23 +1343,31 @@ class Dashboard:
 
     def __rich_console__(self, console, options):
         now = time.time()
+        monotonic_now = time.monotonic()
         st = self.st
         width = options.max_width
         if width != st.width:  # integrations lay out for the new width now, not at their next run
             st.width = width
             for ig in st.integrations:
-                ig.wake.set()
-        slot = {p: [render_integration(ig, now) for ig in st.integrations if ig.position == p]
+                ig.request_refresh(after_current=True)
+        slot = {p: [render_integration(ig, now, ig is st.focus, monotonic_now)
+                    for ig in st.integrations if ig.position == p]
                 for p in POSITIONS}
-        sections = slot["top"] + ([render_usage(st, width, now)] if st.show_usage else [])
-        sections += slot["after-usage"] + [render_mine(st, width, now)] + slot["after-my-prs"]
-        sections += ([render_review(st, width, now)] if st.show_review else []) + slot["bottom"]
+        keys = st.keys
+        mine = render_mine(st, width, now, monotonic_now)
+        review = render_review(st, width, now, monotonic_now) if st.show_review else None
+        if keys["refresh"]:  # the hint sits under the last PR section
+            (review if review is not None else mine).append(line((f"{keys['refresh']} refresh", META)))
+        sections = slot["top"] + ([render_usage(st, width, now, monotonic_now)] if st.show_usage else [])
+        sections += slot["after-usage"] + [mine] + slot["after-my-prs"]
+        sections += ([review] if review is not None else []) + slot["bottom"]
         rows = list(sections[0])
         for rows_of in sections[1:]:
             rows += [Text(), rule(width), *rows_of]
-        foot = f"{time.strftime('%H:%M:%S')} · every {st.interval}s · r refresh · q quit"
-        if st.busy:
-            foot = "refreshing… · " + foot
+        hints = [f"{keys['quit']} quit"] if keys["quit"] else []
+        if len(focusable_integrations(st)) >= 2 and keys["focus"]:
+            hints.append(f"{keys['focus']} focus")
+        foot = " · ".join(hints)
         height = options.height or console.height
         if len(rows) > height - 2:
             hidden = len(rows) - (height - 3)
@@ -1120,11 +1375,12 @@ class Dashboard:
         yield Group(*rows, Text(), line((foot, META)))
 
 
-def refresh(st, pool, usage_every, force):
-    st.busy = True
+def refresh(st, usage_every, force):
+    st.prs_fetching = True
     now = time.time()
-    fu = None
+    invalidate = False
     if st.show_usage:
+        st.usage_fetching = True
         # Other omp sessions keep omp's shared cache fresh, so force a refetch only
         # when the oldest live read is older than usage_every, and never twice in a
         # minute: every forced call is another hit on rate-limited usage endpoints.
@@ -1132,21 +1388,50 @@ def refresh(st, pool, usage_every, force):
         age = oldest_read(st.usage)
         invalidate = (usage_every is not None and since >= 60
                       and (force or age is None or age >= usage_every))
-        fu = pool.submit(fetch_usage, invalidate, st.omp_profile)
-    fp = pool.submit(fetch_prs, st.excluded, st.show_review, st.gh_account)
-    if fu:
+
+    results = queue.Queue()
+
+    def fetch(section, function, *args):
         try:
-            st.usage, st.usage_at, st.usage_err = carry_over(st.usage, fu.result()), time.time(), None
-            if invalidate:
-                st.usage_inval_at = now
-            save_last_good(st.usage, st.cache_profile)
+            results.put((section, function(*args), None))
+        except Exception as e:
+            results.put((section, None, e))
+
+    threading.Thread(target=fetch, args=("prs", fetch_prs, st.excluded, st.show_review, st.gh_account),
+                     daemon=True, name="devdash-prs").start()
+    sections = 1
+    if st.show_usage:
+        threading.Thread(target=fetch, args=("usage", fetch_usage, invalidate, st.omp_profile),
+                         daemon=True, name="devdash-usage").start()
+        sections += 1
+    if st.live is not None:
+        st.live.refresh()
+    for _ in range(sections):
+        section, value, error = results.get()
+        try:
+            if error is not None:
+                raise error
+            if section == "usage":
+                st.usage, st.usage_at, st.usage_err = carry_over(st.usage, value), time.time(), None
+                if invalidate:
+                    st.usage_inval_at = now
+                save_last_good(st.usage, st.cache_profile)
+            else:
+                (st.mine, st.review), st.prs_at, st.prs_err = value, time.time(), None
         except Exception as e:  # keep the last good data on screen
-            st.usage_err = str(e)[:80]
-    try:
-        (st.mine, st.review), st.prs_at, st.prs_err = fp.result(), time.time(), None
-    except Exception as e:
-        st.prs_err = str(e)[:80]
-    st.busy = False
+            if section == "usage":
+                st.usage_err = str(e)[:80]
+            else:
+                st.prs_err = str(e)[:80]
+        finally:
+            if section == "usage":
+                st.usage_fetching = False
+            else:
+                st.prs_fetching = False
+            if st.live is not None:
+                st.live.refresh()
+    if st.live is not None:
+        st.live.refresh()
 
 
 def parse_args():
@@ -1189,6 +1474,7 @@ def main():
     if not shutil.which("gh"):
         raise SystemExit("devdash: needs the GitHub CLI (https://cli.github.com), then `gh auth login`")
     st = State()
+    st.keys = cfg["keys"]
     st.interval = args.interval or cfg["interval"]
     st.excluded = check_rules(list(gh["exclude"]) + args.exclude)
     st.gh_account = args.github or gh["account"] or None
@@ -1224,17 +1510,15 @@ def main():
         hint = "; pass --github USER from `gh auth status`" if st.gh_account else "; run `gh auth login`"
         who = f" as {st.gh_account}" if st.gh_account else ""
         raise SystemExit(f"devdash: gh is not signed in{who} ({e}){hint}") from None
-    pool = ThreadPoolExecutor(2)
-
     st.width = CONSOLE.width
     # Closing the pane sends SIGHUP; exit through `finally` so running integrations are killed.
     for sig in (signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, lambda *_: sys.exit(0))
     try:
         if args.once or not sys.stdin.isatty():
-            print_once(st, pool, usage_every)
+            print_once(st, usage_every)
         else:
-            watch(st, pool, usage_every)
+            watch(st, usage_every)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1242,11 +1526,11 @@ def main():
             ig.stop()
 
 
-def print_once(st, pool, usage_every):
+def print_once(st, usage_every):
     runner = ThreadPoolExecutor(max(1, len(st.integrations)))
     try:
         jobs = [runner.submit(ig.poll, st.width) for ig in st.integrations]
-        refresh(st, pool, usage_every, False)
+        refresh(st, usage_every, False)
         for job in jobs:
             job.result()
     finally:
@@ -1254,29 +1538,71 @@ def print_once(st, pool, usage_every):
     CONSOLE.print(Dashboard(st), height=10_000)
 
 
-def watch(st, pool, usage_every):
+def watch(st, usage_every):
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     tty.setcbreak(fd)
     try:
-        for ig in st.integrations:
-            threading.Thread(target=ig.loop, args=(st,), daemon=True, name=f"integration-{ig.name}").start()
-        force = False
-        with Live(Dashboard(st), console=CONSOLE, screen=True, refresh_per_second=1):
-            while True:
-                refresh(st, pool, usage_every, force)
-                force = False
-                deadline = time.time() + st.interval
-                while (left := deadline - time.time()) > 0:
-                    if select.select([sys.stdin], [], [], left)[0]:
-                        key = os.read(fd, 1).decode(errors="ignore").lower()
-                        if key == "q":
-                            return
-                        if key == "r":
-                            force = True
-                            for ig in st.integrations:
-                                ig.wake.set()
-                            break
+        with integration_state_files(st):
+            focusable = focusable_integrations(st)
+            st.focus = focusable[0] if focusable else None
+            try:
+                live = Live(Dashboard(st), console=CONSOLE, screen=True, refresh_per_second=1)
+                with live:
+                    st.live = live
+                    for ig in st.integrations:
+                        threading.Thread(target=ig.loop, args=(st,), daemon=True,
+                                         name=f"integration-{ig.name}").start()
+                    pending = b""
+                    pending_since = None
+                    force = True
+                    refresh_thread = None
+                    deadline = time.monotonic()
+                    while True:
+                        now = time.monotonic()
+                        if refresh_thread is None or not refresh_thread.is_alive():
+                            if force or now >= deadline:
+                                # An r press during a refresh requests one follow-up run; it is not lost.
+                                run_force = force
+                                force = False
+                                st.prs_fetching = True
+                                st.usage_fetching = st.show_usage
+                                deadline = now + st.interval
+                                st.global_next_fetch = deadline
+                                refresh_thread = threading.Thread(
+                                    target=refresh, args=(st, usage_every, run_force),
+                                    daemon=True, name="devdash-refresh")
+                                refresh_thread.start()
+                                live.refresh()
+                        timeout = max(0, deadline - time.monotonic())
+                        if refresh_thread.is_alive() and (force or timeout == 0):
+                            # poll so a pending follow-up starts as soon as this refresh ends
+                            timeout = 0.2 if timeout == 0 else min(timeout, 0.2)
+                        if pending_since is not None:
+                            timeout = min(timeout, max(0, pending_since + KEY_ESCAPE_TIMEOUT -
+                                                       time.monotonic()))
+                        if select.select([fd], [], [], timeout)[0]:
+                            available = bytearray()
+                            while select.select([fd], [], [], 0)[0]:
+                                chunk = os.read(fd, 65536)
+                                if not chunk:
+                                    break
+                                available.extend(chunk)
+                            keys, pending = decode_keys(bytes(available), pending)
+                            pending_since = time.monotonic() if pending else None
+                            for key in keys:
+                                outcome = dispatch_key(st, key)
+                                if outcome == "quit":
+                                    return
+                                if outcome == "refresh":
+                                    force = True
+                        elif pending_since is not None and time.monotonic() >= pending_since + KEY_ESCAPE_TIMEOUT:
+                            _, pending = decode_keys(b"", pending, flush=True)
+                            pending_since = None
+            finally:
+                st.live = None
+                for ig in st.integrations:
+                    ig.stop()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 

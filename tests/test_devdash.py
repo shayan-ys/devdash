@@ -66,6 +66,63 @@ def test_config_rejects_mistakes(tmp_path, text):
         load(tmp_path, text)
 
 
+
+def test_key_config_accepts_case_sensitive_names_and_records_an_empty_table(tmp_path):
+    cfg = load(tmp_path, '[keys]\nrefresh = "R"\nquit = ""\nfocus = "tab"\n'
+                        '[[integrations]]\nname = "t"\ncommand = ["date"]\nkeys = {}\n')
+    assert cfg["keys"] == {"refresh": "R", "quit": "", "focus": "tab"}
+    assert cfg["integrations"][0]["keys"] == {}
+    assert cfg["integrations"][0]["has_keys"] is True
+
+
+@pytest.mark.parametrize("text", [
+    '[keys]\nrefresh = " "\n',
+    '[keys]\nrefresh = "r"\nquit = "r"\n',
+    '[keys]\nrefresh = 1\n',
+    '[keys]\nunknown = "x"\n',
+    '[[integrations]]\nname = "t"\ncommand = ["date"]\nkeys = 1\n',
+    '[[integrations]]\nname = "t"\ncommand = ["date"]\nkeys = { " " = "newer" }\n',
+    '[[integrations]]\nname = "t"\ncommand = ["date"]\nkeys = { j = "" }\n',
+    '[[integrations]]\nname = "t"\ncommand = ["date"]\nkeys = { j = 7 }\n',
+    '[[integrations]]\nname = "t"\ncommand = ["date"]\nkeys = { "upwards" = "newer" }\n',
+])
+def test_key_config_rejects_invalid_shapes_and_names(tmp_path, text):
+    with pytest.raises(SystemExit):
+        load(tmp_path, text)
+
+
+def test_builtin_binding_conflict_names_key_integration_and_remapping(tmp_path):
+    text = ('[[integrations]]\nname = "t"\ncommand = ["date"]\nenabled = false\n'
+            'keys = { r = "newer" }\n')
+    with pytest.raises(SystemExit) as error:
+        load(tmp_path, text)
+    assert "integration 't'" in str(error.value)
+    assert "key 'r'" in str(error.value)
+    assert "[keys]" in str(error.value)
+
+
+def test_decode_keys_preserves_case_maps_special_keys_and_ignores_other_escapes():
+    decoded, pending = devdash.decode_keys(
+        b"rR\t\r\n\x1b[A\x1bOB\x1b[C\x1bOD\x1b[1;5A\x1b[Z\x1bOP\x1b")
+    assert decoded == ["r", "R", "tab", "enter", "enter", "up", "down", "right", "left"]
+    assert pending == b"\x1b"
+    assert devdash.decode_keys(b"", pending, flush=True) == ([], b"")
+
+
+def test_decode_keys_keeps_partial_sequences_until_the_next_read():
+    decoded, pending = devdash.decode_keys(b"j\x1b[")
+    assert decoded == ["j"] and pending == b"\x1b["
+    decoded, pending = devdash.decode_keys(b"A", pending)
+    assert decoded == ["up"] and pending == b""
+
+
+def test_decode_keys_drops_escapes_with_intermediate_bytes_whole():
+    assert devdash.decode_keys(b"\x1b(Bq\x1b#8j\x1bxk") == (["q", "j", "k"], b"")
+    decoded, pending = devdash.decode_keys(b"\x1b(")
+    assert decoded == [] and pending == b"\x1b("
+    assert devdash.decode_keys(b"Bj", pending) == (["j"], b"")
+
+
 def test_missing_config_is_an_error_only_when_named(tmp_path):
     assert devdash.load_config(str(tmp_path / "none.toml"), explicit=False) == devdash.DEFAULTS
     with pytest.raises(SystemExit):
@@ -96,6 +153,19 @@ def test_usage_profile_selects_omp_auth_and_isolates_last_good(tmp_path, monkeyp
         ["omp", "--profile", "personal", "usage", "invalidate"],
         ["omp", "--profile", "personal", "usage", "--json"],
     ]
+
+
+@pytest.mark.parametrize("cached", [None, {"reports": [{"provider": "cursor", "old": True}]}])
+def test_refresh_replaces_cached_usage_with_the_fresh_report(cached, monkeypatch):
+    fresh = {"reports": [{"provider": "cursor"}], "accountsWithoutUsage": []}
+    monkeypatch.setattr(devdash, "fetch_usage", lambda invalidate, profile: fresh)
+    monkeypatch.setattr(devdash, "fetch_prs", lambda *args: ([], []))
+    monkeypatch.setattr(devdash, "save_last_good", lambda data, profile: None)
+    st = devdash.State()
+    st.usage = cached
+    devdash.refresh(st, None, False)
+    assert st.usage_err is None
+    assert st.usage["reports"] == [{"provider": "cursor"}]
 
 
 def test_openrouter_reads_selected_profile_key_usage_without_storing_credential(monkeypatch):
@@ -526,6 +596,180 @@ def wait_for_pid(pid_file):
             return int(pid_file.read_text())
         time.sleep(0.05)
     pytest.fail("the command never started its child")
+
+
+def test_integration_action_and_state_environment_are_scoped_to_the_run(tmp_path, monkeypatch):
+    code = ("import json, os; print(json.dumps({"
+            "'action': os.environ.get('DEVDASH_ACTION'), "
+            "'state': os.environ.get('DEVDASH_STATE_FILE')}))")
+    ig = integration(code, keys={"j": "newer"})
+    monkeypatch.setenv("DEVDASH_ACTION", "inherited")
+    monkeypatch.setenv("DEVDASH_STATE_FILE", "inherited")
+    ig.poll(40)
+    assert json.loads(ig.result[0][0].plain) == {"action": None, "state": None}
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text("")
+    ig.state_file = str(state_file)
+    ig.poll(40, action="newer")
+    assert json.loads(ig.result[0][0].plain) == {
+        "action": "newer", "state": str(state_file)}
+
+
+def test_watch_state_files_are_empty_private_and_removed(tmp_path):
+    cfg = load(tmp_path, '[[integrations]]\nname = "t"\ncommand = ["date"]\nkeys = {}\n')
+    st = devdash.State()
+    st.integrations = [devdash.Integration(cfg["integrations"][0], 60)]
+    with devdash.integration_state_files(st):
+        path = st.integrations[0].state_file
+        assert path is not None
+        assert os.stat(os.path.dirname(path)).st_mode & 0o777 == 0o700
+        assert os.stat(path).st_mode & 0o777 == 0o600
+        assert open(path, "rb").read() == b""
+    assert st.integrations[0].state_file is None
+    assert not os.path.exists(path)
+
+
+def test_integration_action_queue_drops_presses_after_eight():
+    ig = integration("pass", keys={"j": "newer"})
+    actions = ["newer", "older"] * 4
+    assert all(ig.queue_action(action) for action in actions)
+    assert not ig.queue_action("scope")
+    assert list(ig.actions) == actions
+
+
+def test_integration_action_queue_is_fifo(tmp_path):
+    log = tmp_path / "actions.txt"
+    code = ("import os; "
+            "open(os.environ['ACTION_LOG'], 'a').write("
+            "os.environ.get('DEVDASH_ACTION', 'interval') + '\\n')")
+    ig = integration(code, env={"ACTION_LOG": str(log)}, keys={"j": "newer"})
+    st = devdash.State()
+    st.width = 40
+    thread = devdash.threading.Thread(target=ig.loop, args=(st,), daemon=True)
+    thread.start()
+
+    def wait_for_count(count):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            lines = log.read_text().splitlines() if log.exists() else []
+            if len(lines) >= count:
+                return lines
+            time.sleep(0.01)
+        pytest.fail(f"only {len(lines)} integration runs completed")
+
+    try:
+        wait_for_count(1)
+        actions = ["newer", "older"] * 4
+        assert all(ig.queue_action(action) for action in actions)
+        assert wait_for_count(9)[:9] == ["interval", *actions]
+        time.sleep(0.05)
+        assert log.read_text().splitlines() == ["interval", *actions]
+    finally:
+        ig.stop()
+        thread.join(5)
+    assert not thread.is_alive()
+
+
+def test_focus_cycles_in_screen_order_and_dispatches_only_to_focused_binding():
+    bottom = integration("pass", name="bottom", position="bottom", keys={"j": "older"})
+    top = integration("pass", name="top", position="top", keys={"k": "newer"})
+    st = devdash.State()
+    st.keys = {"refresh": "r", "quit": "q", "focus": "tab"}
+    st.integrations = [bottom, top]  # config order differs from screen order
+    focusable = devdash.focusable_integrations(st)
+    assert focusable == [top, bottom]
+    st.focus = focusable[0]
+    devdash.dispatch_key(st, "k")
+    assert list(top.actions) == ["newer"] and not bottom.actions
+    devdash.dispatch_key(st, "tab")
+    assert st.focus is bottom
+    devdash.dispatch_key(st, "j")
+    assert list(bottom.actions) == ["older"]
+    devdash.dispatch_key(st, "tab")
+    assert st.focus is top
+
+
+def test_each_section_lists_its_own_keys_and_footer_holds_global_keys():
+    top = integration("pass", name="top", position="top", keys={"j": "newer", "k": "older"})
+    bottom = integration("pass", name="bottom", position="bottom", keys={"x": "other"})
+    st = devdash.State()
+    st.show_usage = False
+    st.keys = {"refresh": "R", "quit": "q", "focus": "tab"}
+    st.integrations = [bottom, top]
+    st.focus = top
+    console = Console(record=True, width=120)
+    console.print(devdash.Dashboard(st), height=10_000)
+    lines = [row.rstrip() for row in console.export_text().splitlines()]
+    assert lines[0] == "▸ TOP"
+    assert lines[1] == "j newer · k older"
+    review = next(i for i, row in enumerate(lines) if row.startswith("REVIEW REQUESTED"))
+    assert "R refresh" in lines[review:lines.index("BOTTOM")]
+    assert lines.count("R refresh") == 1
+    assert lines[lines.index("BOTTOM") + 1] == "x other"
+    assert lines[-1] == "q quit · tab focus"
+
+
+def test_refresh_hint_follows_my_prs_when_review_is_hidden_and_focus_needs_two():
+    ig = integration("pass", keys={"j": "newer"})
+    st = devdash.State()
+    st.show_usage = st.show_review = False
+    st.integrations = [ig]
+    st.focus = ig
+    console = Console(record=True, width=80)
+    console.print(devdash.Dashboard(st), height=10_000)
+    lines = [row.rstrip() for row in console.export_text().splitlines()]
+    assert lines.index("r refresh") < lines.index("▸ T")
+    assert lines[-1] == "q quit"
+
+
+def test_key_hint_rows_truncate_with_ellipsis():
+    ig = integration("pass", keys={"j": "long_action_name", "k": "another_long_name"})
+    st = devdash.State()
+    st.show_usage = st.show_review = False
+    st.integrations = [ig]
+    console = Console(record=True, width=24)
+    console.print(devdash.Dashboard(st), height=10_000)
+    hint = console.export_text().splitlines()[-3]
+    assert hint.startswith("j long_action_name") and hint.rstrip().endswith("…")
+    assert len(hint) <= 24
+
+
+def test_section_headings_show_fetch_state_and_countdown_but_once_has_none():
+    now, mono = 1_800_000_000, 1_000.0
+    st = devdash.State()
+    st.mine = []
+    st.prs_at = now - 12
+    st.global_next_fetch = mono + 48
+    prs = devdash.render_mine(st, 80, now, mono)[0].plain
+    assert "fetched 12s ago · next fetch 48s" in prs
+    assert "next fetch 47s" in devdash.section_status(
+        now - 12, False, mono + 48, now, mono + 1)[0]
+
+    st.usage_at = now - 12
+    usage = devdash.render_usage(st, 80, now, mono)[0].plain
+    assert "fetched 12s ago · next fetch 48s" in usage
+    st.prs_fetching = st.usage_fetching = True
+    assert "fetching…" in devdash.render_mine(st, 80, now, mono)[0].plain
+    assert "fetching…" in devdash.render_review(st, 80, now, mono)[0].plain
+    assert "fetching…" in devdash.render_usage(st, 80, now, mono)[0].plain
+
+    ig = integration("pass")
+    ig.result = ([], now - 12, None)
+    ig.next_run_at = mono + 48
+    assert "fetched 12s ago · next fetch 48s" in devdash.render_integration(
+        ig, now, monotonic_now=mono)[0].plain
+    ig.running = True
+    assert "fetching…" in devdash.render_integration(ig, now, monotonic_now=mono)[0].plain
+
+    st.prs_fetching = st.usage_fetching = False
+    st.global_next_fetch = None
+    assert "next fetch" not in devdash.render_mine(st, 80, now, mono)[0].plain
+    assert devdash.render_review(st, 80, now, mono)[0].plain == "REVIEW REQUESTED 0  fetched 12s ago"
+    assert "next fetch" not in devdash.render_usage(st, 80, now, mono)[0].plain
+    ig.running = False
+    ig.next_run_at = None
+    assert "next fetch" not in devdash.render_integration(ig, now, monotonic_now=mono)[0].plain
 
 
 def test_integration_keeps_colour_and_links_drops_screen_control_and_gets_its_room():
