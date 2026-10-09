@@ -142,6 +142,11 @@ Every setting is optional. devdash reads a [TOML](https://toml.io) file from the
 ```toml
 interval = 60                    # seconds between refreshes
 
+[keys]
+refresh = "r"                     # "" disables a built-in; Ctrl-C always quits
+quit = "q"
+focus = "tab"
+
 [github]
 exclude = ["acme/monorepo", "some-org"]   # "owner/repo", or "owner" for all of its repositories
 review_requested = true          # show the REVIEW REQUESTED section
@@ -184,6 +189,43 @@ env = { WTTR_LANG = "en" }           # extra environment variables for the comma
 
 Integrations that share a position appear in the order they are listed in the file.
 
+### Keys, actions, focus, and state
+
+In watch mode, `[keys]` configures the built-in `refresh`, `quit`, and `focus` keys. An empty
+string disables a built-in. Key names are case-sensitive: one printable ASCII character other
+than space, or `up`, `down`, `left`, `right`, `enter`, or `tab`. Arrow keys and Enter/Tab are
+decoded by devdash; Ctrl-C always quits.
+
+An integration can declare `keys = { j = "newer", k = "older" }`, mapping keys to action names
+that the integration itself understands. Bindings are case-sensitive; they cannot use a key
+assigned to an enabled built-in. Remap that built-in in `[keys]` to resolve a conflict. Two
+integrations can use the same binding; only the focused one receives it. Focus starts on the
+first integration with bindings in screen order, and the configured focus key cycles through
+those integrations. The footer is one list of key hints: enabled built-ins, the focus key when two
+or more integrations are focusable, then the focused integration's bindings in config order. The
+focused section's heading starts with `▸ `.
+
+Section headings show how long ago the last result was fetched and count down to the next fetch,
+updating every second. Integrations use their own intervals; MY PRS uses the global interval, and
+USAGE follows its effective usage-refetch cadence. While a section is fetching, its heading says
+`fetching…`. `--once` shows no countdown. The footer contains only key hints.
+
+Global PR and usage refreshes run in the background, so input remains responsive. Pressing `r`
+while one is running schedules one follow-up refresh; key presses after `r` in the same input batch
+are still handled.
+
+Each binding press runs the integration's command again with `DEVDASH_ACTION` set to its action.
+Other runs have no `DEVDASH_ACTION`, even if it was inherited from the environment. Presses queue
+in order (up to eight waiting actions); a run already in progress finishes first, and queued
+actions run before the next interval refresh. The interval starts at the end of the last run.
+`refresh` wakes all integrations, and any run satisfies that request.
+
+In watch mode, an enabled integration that declares a `keys` table receives `DEVDASH_STATE_FILE`
+pointing to an initially empty file in a private directory. The file is mode `0600`; its directory
+is mode `0700`. devdash never reads the file: the integration owns its format and can use it to
+preserve its view or selection between command runs. State lasts only for one devdash process.
+`--once` and non-TTY runs set neither `DEVDASH_ACTION` nor `DEVDASH_STATE_FILE`.
+
 **What a command must do.** Print the section body and exit with status 0. Any language works:
 a shell script, a Python file, or an existing CLI with a one-shot mode. devdash sets `COLUMNS`
 to the pane width and `LINES` to `max_rows`, so the command can fit its output to the room it has;
@@ -205,16 +247,18 @@ devdash runs the `command` list directly, without a shell; to use pipes or `&&`,
 integration runs on its own thread, with no standard input and in its own process group, so a
 slow or hung command cannot freeze the dashboard or read your keystrokes. A timeout kills the
 command together with every process it started that stayed in its process group; a program
-that starts its own session (a daemon, for example) escapes this. Quitting devdash, with `q`,
-Ctrl-C, or by closing the pane, kills running commands the same way. Pressing `r` runs every
-waiting integration again at once. With `--once`, devdash runs all integrations in parallel,
-each within its own timeout, alongside the built-in GitHub and usage reads.
+that starts its own session (a daemon, for example) escapes this. Quitting devdash with the
+configured quit key, Ctrl-C, or by closing the pane kills running commands the same way. Pressing
+the configured refresh key runs every waiting integration again at once. With `--once`, devdash
+runs all integrations in parallel, each within its own timeout, alongside the built-in GitHub
+and usage reads.
 
 ### Example: prompt-tutor
 
 [prompt-tutor](https://github.com/shayan-ys/prompt-tutor) reviews the English of the prompts you
 send to omp, and its Watcher shows the latest Review. Its one-shot mode, `prompt-tutor --once`,
 prints one frame sized to `COLUMNS` and `LINES` and exits, so it works as an integration as is.
+The key actions and state-file behavior below require a prompt-tutor build with devdash key support.
 
 1. Install prompt-tutor and put its Watcher on your `PATH`. Until prompt-tutor's first build is
    merged into its `main` branch, `main` holds only planning documents, so install the
@@ -242,12 +286,14 @@ prints one frame sized to `COLUMNS` and `LINES` and exits, so it works as an int
    command = ["prompt-tutor", "--once"]
    position = "bottom"
    max_rows = 16
+   keys = { j = "newer", k = "older", s = "scope", J = "scroll-down", K = "scroll-up" }
    ```
 
    If devdash shows `⚠ cannot run prompt-tutor`, the Watcher link is not on the `PATH` that
    devdash sees; use its full path, for example `command = ["~/.local/bin/prompt-tutor", "--once"]`.
-4. Run `devdash`. The section updates on the global interval; press `r` to refresh it after a
-   prompt, and use `devdash --no-integration prompt-tutor` to hide it for one run.
+4. Run `devdash`. The section updates on the global interval; press `j`/`k` for newer/older Prompts,
+   `s` to change Scope, and `J`/`K` to scroll the Watcher frame. The integration keeps its view and
+   selection in the state file. Press `r` to refresh the dashboard, and use `devdash --no-integration prompt-tutor` to hide it.
 
 ## Troubleshooting
 

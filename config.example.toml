@@ -5,6 +5,12 @@
 # Seconds between refreshes.
 interval = 60
 
+# Interactive keys. Empty strings disable a built-in; Ctrl-C still quits.
+[keys]
+refresh = "r"
+quit = "q"
+focus = "tab"
+
 [github]
 # Repositories to hide from both PR sections. An entry is "owner/repo" for one repository,
 # or a bare "owner" for every repository of that user or organization.
@@ -50,3 +56,6 @@ order = []  # e.g. ["openai-codex", "anthropic"]
 # max_rows = 20               # longer output is cut
 # enabled = true
 # env = {}                    # extra environment variables, e.g. { CITY = "Toronto" }
+# Integration bindings map keys to action names the command understands.
+# Example for a build with prompt-tutor key support:
+# keys = { j = "newer", k = "older", s = "scope", J = "scroll-down", K = "scroll-up" }
