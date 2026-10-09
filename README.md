@@ -201,14 +201,15 @@ that the integration itself understands. Bindings are case-sensitive; they canno
 assigned to an enabled built-in. Remap that built-in in `[keys]` to resolve a conflict. Two
 integrations can use the same binding; only the focused one receives it. Focus starts on the
 first integration with bindings in screen order, and the configured focus key cycles through
-those integrations. The footer is one list of key hints: enabled built-ins, the focus key when two
-or more integrations are focusable, then the focused integration's bindings in config order. The
-focused section's heading starts with `▸ `.
+those integrations. Each section lists its own keys on its last row: an integration's bindings in
+config order under its output, and the refresh key under the last PR section. The bottom row lists
+the keys for the whole dashboard: quit, and the focus key when two or more integrations are
+focusable. The focused section's heading starts with `▸ `.
 
 Section headings show how long ago the last result was fetched and count down to the next fetch,
 updating every second. Integrations use their own intervals; MY PRS uses the global interval, and
 USAGE follows its effective usage-refetch cadence. While a section is fetching, its heading says
-`fetching…`. `--once` shows no countdown. The footer contains only key hints.
+`fetching…`. `--once` shows no countdown.
 
 Global PR and usage refreshes run in the background, so input remains responsive. Pressing `r`
 while one is running schedules one follow-up refresh; key presses after `r` in the same input batch

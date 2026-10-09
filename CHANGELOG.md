@@ -14,7 +14,7 @@ All notable changes to this project are documented here. The format follows
   failure keeps its last good output on screen under the error. `--no-integration NAME`
   hides one integration and `--no-integrations` hides all of them.
 - Configurable, case-sensitive built-in keys and per-integration actions, with private state files in watch mode,
-  focus-aware footer hints, and fetch countdowns on section headings.
+  per-section key hints, and fetch countdowns on section headings.
 - `--profile NAME` selects the matching isolated omp profile for usage and cached readings;
   only that profile's authenticated providers appear. Provider headings include that
   provider's account email in white, for example `Codex (user@example.com)`.
@@ -32,7 +32,8 @@ All notable changes to this project are documented here. The format follows
 - Built-in keys are case-sensitive; uppercase `R` and `Q` no longer trigger refresh or quit.
 - Global PR and usage refreshes run in the background; input stays responsive while they fetch.
   Pressing refresh during an active refresh schedules one follow-up.
-- Section headings continue to show `fetching…` during a fetch; the footer contains only key hints.
+- Section headings continue to show `fetching…` during a fetch. Each section lists its own keys;
+  the bottom row lists only quit and focus.
 
 ### Fixed
 

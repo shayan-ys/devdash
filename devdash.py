@@ -900,8 +900,11 @@ def render_mine(st, width, now, monotonic_now=None):
     return out
 
 
-def render_review(st, width, now):
-    out = [line(("REVIEW REQUESTED ", H1), (str(len(st.review)), H1)), Text()]
+def render_review(st, width, now, monotonic_now=None):
+    if monotonic_now is None:
+        monotonic_now = time.monotonic()
+    status = section_status(st.prs_at, st.prs_fetching, st.global_next_fetch, now, monotonic_now)
+    out = [line(("REVIEW REQUESTED ", H1), (str(len(st.review)), H1), status), Text()]
     if not st.review:
         out.append(line(("nothing waiting on you", META)))
     for ri, pr in enumerate(sorted(st.review, key=lambda p: p["updatedAt"], reverse=True)):
@@ -1305,7 +1308,10 @@ def render_integration(ig, now, focused=False, monotonic_now=None):
     out = [line(("▸ " if focused else "", H1), (ig.title, H1), status)]
     if err:
         out.append(line((f"⚠ {err}", BAD)))
-    return out + rows
+    out += rows
+    if ig.keys:
+        out.append(line((" · ".join(f"{key} {action}" for key, action in ig.keys.items()), META)))
+    return out
 
 
 
@@ -1356,19 +1362,20 @@ class Dashboard:
         slot = {p: [render_integration(ig, now, ig is st.focus, monotonic_now)
                     for ig in st.integrations if ig.position == p]
                 for p in POSITIONS}
+        keys = st.keys
+        mine = render_mine(st, width, now, monotonic_now)
+        review = render_review(st, width, now, monotonic_now) if st.show_review else None
+        if keys["refresh"]:  # the hint sits under the last PR section
+            (review if review is not None else mine).append(line((f"{keys['refresh']} refresh", META)))
         sections = slot["top"] + ([render_usage(st, width, now, monotonic_now)] if st.show_usage else [])
-        sections += slot["after-usage"] + [render_mine(st, width, now, monotonic_now)] + slot["after-my-prs"]
-        sections += ([render_review(st, width, now)] if st.show_review else []) + slot["bottom"]
+        sections += slot["after-usage"] + [mine] + slot["after-my-prs"]
+        sections += ([review] if review is not None else []) + slot["bottom"]
         rows = list(sections[0])
         for rows_of in sections[1:]:
             rows += [Text(), rule(width), *rows_of]
-        keys = st.keys
-        hints = [f"{keys[name]} {name}" for name in ("refresh", "quit") if keys[name]]
-        focusable = focusable_integrations(st)
-        if len(focusable) >= 2 and keys["focus"]:
+        hints = [f"{keys['quit']} quit"] if keys["quit"] else []
+        if len(focusable_integrations(st)) >= 2 and keys["focus"]:
             hints.append(f"{keys['focus']} focus")
-        if st.focus is not None:
-            hints.extend(f"{key} {action}" for key, action in st.focus.keys.items())
         foot = " · ".join(hints)
         height = options.height or console.height
         if len(rows) > height - 2:
@@ -1414,7 +1421,7 @@ def refresh(st, usage_every, force):
             if error is not None:
                 raise error
             if section == "usage":
-                st.usage, st.usage_at, st.usage_err = carry_over(value, st.usage), time.time(), None
+                st.usage, st.usage_at, st.usage_err = carry_over(st.usage, value), time.time(), None
                 if invalidate:
                     st.usage_inval_at = now
                 save_last_good(st.usage, st.cache_profile)

@@ -149,6 +149,19 @@ def test_usage_profile_selects_omp_auth_and_isolates_last_good(tmp_path, monkeyp
     ]
 
 
+@pytest.mark.parametrize("cached", [None, {"reports": [{"provider": "cursor", "old": True}]}])
+def test_refresh_replaces_cached_usage_with_the_fresh_report(cached, monkeypatch):
+    fresh = {"reports": [{"provider": "cursor"}], "accountsWithoutUsage": []}
+    monkeypatch.setattr(devdash, "fetch_usage", lambda invalidate, profile: fresh)
+    monkeypatch.setattr(devdash, "fetch_prs", lambda *args: ([], []))
+    monkeypatch.setattr(devdash, "save_last_good", lambda data, profile: None)
+    st = devdash.State()
+    st.usage = cached
+    devdash.refresh(st, None, False)
+    assert st.usage_err is None
+    assert st.usage["reports"] == [{"provider": "cursor"}]
+
+
 def test_openrouter_reads_selected_profile_key_usage_without_storing_credential(monkeypatch):
     from io import BytesIO
     from subprocess import CompletedProcess
@@ -671,29 +684,27 @@ def test_focus_cycles_in_screen_order_and_dispatches_only_to_focused_binding():
     assert st.focus is top
 
 
-def test_dashboard_marks_focus_and_lists_focused_bindings_only_in_footer():
-    top = integration("pass", name="top", position="top",
-                      keys={"j": "newer", "k": "older", "s": "scope",
-                            "J": "scroll-down", "K": "scroll-up"})
+def test_each_section_lists_its_own_keys_and_footer_holds_global_keys():
+    top = integration("pass", name="top", position="top", keys={"j": "newer", "k": "older"})
     bottom = integration("pass", name="bottom", position="bottom", keys={"x": "other"})
     st = devdash.State()
-    st.show_usage = st.show_review = False
-    st.keys = {"refresh": "R", "quit": "", "focus": "tab"}
+    st.show_usage = False
+    st.keys = {"refresh": "R", "quit": "q", "focus": "tab"}
     st.integrations = [bottom, top]
     st.focus = top
     console = Console(record=True, width=120)
     console.print(devdash.Dashboard(st), height=10_000)
-    text = console.export_text()
-    assert "▸ TOP" in text and "BOTTOM" in text
-    assert text.splitlines()[-1] == (
-        "R refresh · tab focus · j newer · k older · s scope · J scroll-down · K scroll-up")
-    assert "x other" not in text
-    assert text.count("j newer") == 1
-    assert "q quit" not in text
-    assert "every " not in text and ":" not in text.splitlines()[-1]
+    lines = [row.rstrip() for row in console.export_text().splitlines()]
+    assert lines[0] == "▸ TOP"
+    assert lines[1] == "j newer · k older"
+    review = next(i for i, row in enumerate(lines) if row.startswith("REVIEW REQUESTED"))
+    assert "R refresh" in lines[review:lines.index("BOTTOM")]
+    assert lines.count("R refresh") == 1
+    assert lines[lines.index("BOTTOM") + 1] == "x other"
+    assert lines[-1] == "q quit · tab focus"
 
 
-def test_footer_omits_focus_key_with_fewer_than_two_focusable_integrations():
+def test_refresh_hint_follows_my_prs_when_review_is_hidden_and_focus_needs_two():
     ig = integration("pass", keys={"j": "newer"})
     st = devdash.State()
     st.show_usage = st.show_review = False
@@ -701,21 +712,21 @@ def test_footer_omits_focus_key_with_fewer_than_two_focusable_integrations():
     st.focus = ig
     console = Console(record=True, width=80)
     console.print(devdash.Dashboard(st), height=10_000)
-    footer = console.export_text().splitlines()[-1]
-    assert footer == "r refresh · q quit · j newer"
-    assert "tab focus" not in footer
+    lines = [row.rstrip() for row in console.export_text().splitlines()]
+    assert lines.index("r refresh") < lines.index("▸ T")
+    assert lines[-1] == "q quit"
 
 
-def test_footer_truncates_with_ellipsis():
-    ig = integration("pass", keys={"j": "long_action_name"})
+def test_key_hint_rows_truncate_with_ellipsis():
+    ig = integration("pass", keys={"j": "long_action_name", "k": "another_long_name"})
     st = devdash.State()
     st.show_usage = st.show_review = False
     st.integrations = [ig]
-    st.focus = ig
     console = Console(record=True, width=24)
     console.print(devdash.Dashboard(st), height=10_000)
-    footer = console.export_text().splitlines()[-1]
-    assert len(footer) <= 24 and "…" in footer
+    hint = console.export_text().splitlines()[-3]
+    assert hint.startswith("j long_action_name") and hint.rstrip().endswith("…")
+    assert len(hint) <= 24
 
 
 def test_section_headings_show_fetch_state_and_countdown_but_once_has_none():
@@ -734,6 +745,7 @@ def test_section_headings_show_fetch_state_and_countdown_but_once_has_none():
     assert "fetched 12s ago · next fetch 48s" in usage
     st.prs_fetching = st.usage_fetching = True
     assert "fetching…" in devdash.render_mine(st, 80, now, mono)[0].plain
+    assert "fetching…" in devdash.render_review(st, 80, now, mono)[0].plain
     assert "fetching…" in devdash.render_usage(st, 80, now, mono)[0].plain
 
     ig = integration("pass")
@@ -747,6 +759,7 @@ def test_section_headings_show_fetch_state_and_countdown_but_once_has_none():
     st.prs_fetching = st.usage_fetching = False
     st.global_next_fetch = None
     assert "next fetch" not in devdash.render_mine(st, 80, now, mono)[0].plain
+    assert devdash.render_review(st, 80, now, mono)[0].plain == "REVIEW REQUESTED 0  fetched 12s ago"
     assert "next fetch" not in devdash.render_usage(st, 80, now, mono)[0].plain
     ig.running = False
     ig.next_run_at = None
