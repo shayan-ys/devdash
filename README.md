@@ -302,12 +302,14 @@ devdash scrolls the dashboard when the frame is taller than the pane.
    position = "bottom"
    max_rows = 100
    watch = ["~/.local/share/prompt-tutor", "~/.config/prompt-tutor"]
+   interval = 1
    keys = { j = "newer", k = "older", s = "scope" }
    ```
 
    If devdash shows `⚠ cannot run prompt-tutor`, the Watcher link is not on the `PATH` that
    devdash sees; use its full path, for example `command = ["~/.local/bin/prompt-tutor", "--once"]`.
-4. Run `devdash`. The section updates when prompt-tutor data changes; press `j`/`k` for newer/older Prompts
+4. Run `devdash`. The section updates when prompt-tutor data changes, and `interval = 1` reruns it every second
+   so the `reviewing… Ns` timer of a pending Review keeps counting; press `j`/`k` for newer/older Prompts
    and `s` to change Scope. The integration keeps its view and selection in the state file. A long Review
    makes the dashboard taller than the pane; scroll it with the dashboard's scroll keys. Press `r` to
    refresh the dashboard, and use `devdash --no-integration prompt-tutor` to hide it.
