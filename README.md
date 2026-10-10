@@ -281,7 +281,8 @@ and usage reads.
 
 [prompt-tutor](https://github.com/shayan-ys/prompt-tutor) reviews the English of the prompts you
 send to omp, and its Watcher shows the latest Review. Its one-shot mode, `prompt-tutor --once`,
-prints one frame sized to `COLUMNS` and `LINES` and exits, so it works as an integration as is.
+prints one frame as wide as `COLUMNS` and as tall as its content, and exits, so it works as an integration as is;
+devdash scrolls the dashboard when the frame is taller than the pane.
 The key actions and state-file behavior below require a prompt-tutor build with devdash key support.
 
 1. Install prompt-tutor and put its Watcher on your `PATH`. Until prompt-tutor's first build is
@@ -298,7 +299,7 @@ The key actions and state-file behavior below require a prompt-tutor build with 
 2. Check that the frame fits a narrow pane:
 
    ```sh
-   COLUMNS=50 LINES=16 prompt-tutor --once < /dev/null | cat
+   COLUMNS=50 prompt-tutor --once < /dev/null | cat
    ```
 
 3. Add it to your devdash config (`~/.config/devdash/config.toml` by default), here at the bottom:
@@ -309,16 +310,17 @@ The key actions and state-file behavior below require a prompt-tutor build with 
    title = "PROMPT TUTOR"
    command = ["prompt-tutor", "--once"]
    position = "bottom"
-   max_rows = 16
+   max_rows = 100
    watch = ["~/.local/share/prompt-tutor", "~/.config/prompt-tutor"]
-   keys = { j = "newer", k = "older", s = "scope", J = "scroll-down", K = "scroll-up" }
+   keys = { j = "newer", k = "older", s = "scope" }
    ```
 
    If devdash shows `⚠ cannot run prompt-tutor`, the Watcher link is not on the `PATH` that
    devdash sees; use its full path, for example `command = ["~/.local/bin/prompt-tutor", "--once"]`.
-4. Run `devdash`. The section updates when prompt-tutor data changes; press `j`/`k` for newer/older Prompts,
-   `s` to change Scope, and `J`/`K` to scroll the Watcher frame. The integration keeps its view and
-   selection in the state file. Press `r` to refresh the dashboard, and use `devdash --no-integration prompt-tutor` to hide it.
+4. Run `devdash`. The section updates when prompt-tutor data changes; press `j`/`k` for newer/older Prompts
+   and `s` to change Scope. The integration keeps its view and selection in the state file. A long Review
+   makes the dashboard taller than the pane; scroll it with the dashboard's scroll keys. Press `r` to
+   refresh the dashboard, and use `devdash --no-integration prompt-tutor` to hide it.
 
 ## Troubleshooting
 
