@@ -280,22 +280,12 @@ and usage reads.
 ### Example: prompt-tutor
 
 [prompt-tutor](https://github.com/shayan-ys/prompt-tutor) reviews the English of the prompts you
-send to omp, and its Watcher shows the latest Review. Its one-shot mode, `prompt-tutor --once`,
+send to omp and Claude Code, and its Watcher shows the latest Review. Its one-shot mode, `prompt-tutor --once`,
 prints one frame as wide as `COLUMNS` and as tall as its content, and exits, so it works as an integration as is;
 devdash scrolls the dashboard when the frame is taller than the pane.
-The key actions and state-file behavior below require a prompt-tutor build with devdash key support.
 
-1. Install prompt-tutor and put its Watcher on your `PATH`. Until prompt-tutor's first build is
-   merged into its `main` branch, `main` holds only planning documents, so install the
-   `build/v0` branch:
-
-   ```sh
-   omp plugin install 'github:shayan-ys/prompt-tutor#build/v0'
-   ```
-
-   Restart omp, then run `/prompt-tutor install-watcher` inside omp. After the merge, follow
-   prompt-tutor's [install instructions](https://github.com/shayan-ys/prompt-tutor#install),
-   which install from `main`.
+1. Install prompt-tutor and put its Watcher on your `PATH` by following prompt-tutor's
+   [Set up](https://github.com/shayan-ys/prompt-tutor#set-up) steps.
 2. Check that the frame fits a narrow pane:
 
    ```sh
