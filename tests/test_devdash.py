@@ -1022,3 +1022,31 @@ def test_integrations_render_in_their_slots_between_built_in_sections():
     heads = [r for r in console.export_text().splitlines() if r.split(" ")[0].isupper() and r.strip()]
     assert [h.split("  ")[0].strip() for h in heads] == [
         "TOP", "USAGE", "AFTER-USAGE", "MY PRS 0", "AFTER-MY-PRS", "REVIEW REQUESTED 0", "BOTTOM", "BOTTOM2"]
+
+
+def test_usage_json_adds_pace_and_keeps_stale_reads(monkeypatch, tmp_path):
+    day = 86400
+    now = time.time()
+    weekly = {"window": {"id": "7d", "durationMs": 7 * day * 1000, "resetsAt": (now + 3.5 * day) * 1000},
+              "amount": {"usedFraction": 0.8}, "status": "ok"}
+    old = {"reports": [{"provider": "anthropic", "limits": [weekly]}]}
+    new = {"reports": [{"provider": "cursor", "limits": []}], "accountsWithoutUsage": [{"provider": "anthropic"}]}
+    monkeypatch.setattr(devdash, "LAST_GOOD", str(tmp_path / "last.json"))
+    monkeypatch.delenv("OMP_PROFILE", raising=False)
+    devdash.save_last_good(old)
+    monkeypatch.setattr(devdash, "fetch_usage", lambda invalidate, profile=None: new)
+    data = devdash.usage_json()
+    anthropic = next(r for r in data["reports"] if r["provider"] == "anthropic")
+    assert anthropic["stale"] is True
+    assert anthropic["limits"][0]["pace"] == 30
+
+
+def test_usage_json_falls_back_to_last_good_on_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(devdash, "LAST_GOOD", str(tmp_path / "last.json"))
+    monkeypatch.delenv("OMP_PROFILE", raising=False)
+    devdash.save_last_good({"reports": [{"provider": "anthropic", "limits": []}]})
+
+    def fail(invalidate, profile=None):
+        raise RuntimeError("429")
+    monkeypatch.setattr(devdash, "fetch_usage", fail)
+    assert devdash.usage_json()["reports"][0]["stale"] is True
