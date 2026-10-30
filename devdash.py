@@ -357,6 +357,27 @@ def carry_over(old, new):
     return new
 
 
+def usage_json(profile=None):
+    """One usage read for scripts: omp's report, providers omp dropped filled from the
+    last good read (marked stale), and a `pace` in points on each limit that has one."""
+    cache = profile if profile is not None else os.environ.get("OMP_PROFILE")
+    data = load_last_good(cache)
+    try:
+        data = carry_over(data, fetch_usage(False, profile))
+        save_last_good(data, cache)
+    except Exception as e:
+        if not data:
+            raise SystemExit(f"devdash: usage read failed ({e})") from None
+        data = {"reports": [dict(r, stale=True) for r in data.get("reports", [])]}
+    now = time.time()
+    for report in data.get("reports", []):
+        for lim in report.get("limits", []):
+            points = pace(lim, now)
+            if points is not None:
+                lim["pace"] = points
+    return data
+
+
 def last_good_path(profile=None):
     """Return the cache path for a selected omp profile, or the legacy default."""
     if profile is None:
@@ -1565,12 +1586,17 @@ def parse_args():
     ap.add_argument("--cached", action="store_true",
                     help="never force a usage refetch; show whatever omp's shared cache holds")
     ap.add_argument("--once", action="store_true", help="print one frame and exit")
+    ap.add_argument("--usage-json", action="store_true",
+                    help="print the AI usage read as JSON, with stale carry-over and pace points, and exit")
     ap.add_argument("-V", "--version", action="version", version=f"devdash {__version__}")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.usage_json:
+        print(json.dumps(usage_json(args.profile)))
+        return
     path = args.config or os.environ.get("DEVDASH_CONFIG")
     cfg = load_config(os.path.expanduser(path or CONFIG_PATH), explicit=bool(path))
     gh, usage = cfg["github"], cfg["usage"]

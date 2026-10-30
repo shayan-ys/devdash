@@ -83,6 +83,7 @@ devdash --exclude acme             # hide every repository of a user or organiza
 devdash --no-review --no-usage     # show only your own PRs
 devdash --no-integration weather   # hide one custom integration (--no-integrations hides all)
 devdash --profile personal --once  # show usage from the personal omp profile
+devdash --usage-json               # print the usage read as JSON for scripts, with pace points
 devdash --github alice             # MY PRS / REVIEW REQUESTED for this gh login
 devdash --help                     # all flags
 ```

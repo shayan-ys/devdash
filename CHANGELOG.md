@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `--usage-json` prints one usage read as JSON and exits: omp's report, providers omp dropped
+  filled from the last good read and marked `stale`, and a `pace` in points on each limit that has one.
+  Scripts (for example a quota-aware model router) read it instead of re-implementing devdash.
 - Custom integrations: any number of `[[integrations]]` sections, each a command whose
   output devdash shows at `top`, `after-usage`, `after-my-prs`, or `bottom`. Each runs on
   its own thread and schedule, with a timeout that kills its whole process group, and a
